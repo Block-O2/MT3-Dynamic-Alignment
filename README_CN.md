@@ -320,6 +320,17 @@ Franka Panda 闭环追踪演示：末端根据 tracker 输出和 PyBullet IK 控
 相比纯反应式控制，延迟补偿（τ=0.1s）将平均相对误差从 **22.9mm 降至 19.1mm**（−17%）。
 这一优势在完整轨迹上保持一致。
 
+### MT3 集成：静态 Demo → 移动物体
+
+![MT3 集成误差](simulation/results/mt3_integration_error.png)
+![MT3 集成轨迹](simulation/results/mt3_integration_trajectory.png)
+
+核心结果：在**静态物体**上示教得到的操作轨迹，可以在**移动物体**上成功重放，且无需重新训练。
+
+- 蓝线：EE 到方块的距离稳定保持在 demo offset（120mm）✓
+- 橙线：object frame 中相对 demo 轨迹的偏差在 >90% 帧中保持 <30mm ✓
+- 轨迹图：末端在 object frame 中的位置始终聚集在 30mm 成功圈内
+
 - Franka Panda 闭环稳态相对误差：约 20mm
 - 运行过程中末端姿态固定为竖直向下
 - Demo GIF 由 PyBullet 渲染帧生成，并以 3x 速度播放

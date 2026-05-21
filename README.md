@@ -319,6 +319,18 @@ Closed-loop Panda tracking demo: the end-effector maintains a constant relative 
 Latency compensation (τ=0.1s) reduces mean relative error from **22.9mm to 19.1mm** (−17%)
 compared to pure reactive control. Advantage is consistent across the full trajectory.
 
+### MT3 Integration: Static Demo → Moving Object
+
+![MT3 Integration Error](simulation/results/mt3_integration_error.png)
+![MT3 Integration Trajectory](simulation/results/mt3_integration_trajectory.png)
+
+Core result: a manipulation trajectory demonstrated on a **static object**
+is successfully replayed on a **moving object** without any retraining.
+
+- Blue line: EE-to-box distance stays constant at demo offset (120mm) ✓
+- Orange line: deviation from demo trajectory in object frame stays <30mm for >90% of frames ✓
+- Trajectory plot: end-effector position in object frame clusters within 30mm success band throughout
+
 - Franka Panda closed-loop relative error: ~20mm steady state
 - End-effector orientation is locked downward throughout the run
 - Demo GIF is recorded from rendered PyBullet frames at 3x playback speed
