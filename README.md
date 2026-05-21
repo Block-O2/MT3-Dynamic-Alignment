@@ -312,6 +312,13 @@ Closed-loop Panda tracking demo: the end-effector maintains a constant relative 
 ![Closed-loop 3D trajectories](simulation/results/closed_loop_3d_trajectories.png)
 ![Closed-loop relative error](simulation/results/closed_loop_relative_error.png)
 
+### Latency Compensation Effect
+
+![Baseline Comparison](simulation/results/baseline_comparison.png)
+
+Latency compensation (τ=0.1s) reduces mean relative error from **22.9mm to 19.1mm** (−17%)
+compared to pure reactive control. Advantage is consistent across the full trajectory.
+
 - Franka Panda closed-loop relative error: ~20mm steady state
 - End-effector orientation is locked downward throughout the run
 - Demo GIF is recorded from rendered PyBullet frames at 3x playback speed

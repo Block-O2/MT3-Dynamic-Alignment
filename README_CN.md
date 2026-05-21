@@ -313,6 +313,13 @@ Franka Panda 闭环追踪演示：末端根据 tracker 输出和 PyBullet IK 控
 ![闭环 3D 轨迹](simulation/results/closed_loop_3d_trajectories.png)
 ![闭环相对误差](simulation/results/closed_loop_relative_error.png)
 
+### 延迟补偿效果
+
+![基线对比](simulation/results/baseline_comparison.png)
+
+相比纯反应式控制，延迟补偿（τ=0.1s）将平均相对误差从 **22.9mm 降至 19.1mm**（−17%）。
+这一优势在完整轨迹上保持一致。
+
 - Franka Panda 闭环稳态相对误差：约 20mm
 - 运行过程中末端姿态固定为竖直向下
 - Demo GIF 由 PyBullet 渲染帧生成，并以 3x 速度播放
