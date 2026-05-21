@@ -331,6 +331,14 @@ is successfully replayed on a **moving object** without any retraining.
 - Orange line: deviation from demo trajectory in object frame stays <30mm for >90% of frames ✓
 - Trajectory plot: end-effector position in object frame clusters within 30mm success band throughout
 
+### Speed Sensitivity Analysis
+
+![Speed Sensitivity](simulation/results/speed_sensitivity.png)
+
+System maintains **>94% success rate** up to 6 cm/s, with graceful degradation
+to 87% at the designed operating limit (10 cm/s). No abrupt failure within the
+operating range. Error bars represent variance across 3 trials.
+
 - Franka Panda closed-loop relative error: ~20mm steady state
 - End-effector orientation is locked downward throughout the run
 - Demo GIF is recorded from rendered PyBullet frames at 3x playback speed

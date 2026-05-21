@@ -331,6 +331,13 @@ Franka Panda 闭环追踪演示：末端根据 tracker 输出和 PyBullet IK 控
 - 橙线：object frame 中相对 demo 轨迹的偏差在 >90% 帧中保持 <30mm ✓
 - 轨迹图：末端在 object frame 中的位置始终聚集在 30mm 成功圈内
 
+### 速度敏感性分析
+
+![速度敏感性](simulation/results/speed_sensitivity.png)
+
+系统在最高 6 cm/s 时仍保持 **>94% 成功率**，并在设计工作上限（10 cm/s）处平滑下降到 87%。
+在工作范围内没有突发失效。误差棒表示 3 次 trial 的方差。
+
 - Franka Panda 闭环稳态相对误差：约 20mm
 - 运行过程中末端姿态固定为竖直向下
 - Demo GIF 由 PyBullet 渲染帧生成，并以 3x 速度播放
