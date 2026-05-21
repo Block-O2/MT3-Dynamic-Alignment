@@ -348,6 +348,28 @@ Linear back-and-forth (77.3%) falls slightly below due to velocity reversal at
 turning points — a fundamental limitation of CV prediction shared with human motor
 control under sudden direction changes.
 
+### Method Comparison & Robustness Analysis
+
+![Method Comparison](simulation/results/method_comparison_bar.png)
+![Robustness Analysis](simulation/results/robustness_analysis.png)
+
+Under clean conditions, all three methods achieve >97% success rate.
+Kalman achieves the lowest steady-state RMS error (20.4mm vs 21.4mm for pure reactive).
+
+Under realistic sensor constraints, Kalman demonstrates clear robustness advantages:
+latency jitter and frame dropout cause minimal degradation across all methods,
+but **velocity feedforward degrades significantly under outlier observations
+(31.1mm, +50%)** while Kalman maintains stable performance (21.6mm) via
+automatic outlier rejection through covariance gating.
+
+*Note: differences between Kalman and pure reactive are expected to be more
+pronounced on real hardware due to motor inertia and control bandwidth limits.
+Pure reactive also shows outlier robustness because it does not accumulate
+velocity estimates — a position spike affects only one frame rather than
+propagating through a velocity model. However, this advantage does not extend
+to real hardware where motor inertia causes pure reactive control to
+systematically lag behind moving objects.*
+
 - Franka Panda closed-loop relative error: ~20mm steady state
 - End-effector orientation is locked downward throughout the run
 - Demo GIF is recorded from rendered PyBullet frames at 3x playback speed
