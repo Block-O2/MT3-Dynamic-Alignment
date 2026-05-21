@@ -2,6 +2,13 @@
 
 > **Status**: Core algorithm implemented and tested on synthetic data. Hardware validation on Sawyer + RealSense D415 in progress.
 
+## Demo
+
+![Franka Panda tracking a moving object in PyBullet simulation](simulation/results/demo.gif)
+
+*Franka Panda end-effector tracking a moving box (circular trajectory, R=0.15m, ω=0.3 rad/s).
+Steady-state relative error: ~20mm. No retraining required.*
+
 Extends MT3's one-time static GICP alignment to **continuous tracking**, enabling robotic arms to grasp moving objects using only a single static demonstration.
 
 **Hardware**: Sawyer 7-DOF robot arm + RealSense D415 (head-mounted). Pure Python, ROS-free, no training required, fully analytical and interpretable.
@@ -299,6 +306,15 @@ observed via a virtual overhead RGB-D camera.
 - Steady-state tracking error: **4–5 mm** (consistent with D415 noise level)
 - Cold-start convergence: ~1 second
 - Simulation uses real depth image rendering, not synthetic noise
+
+Closed-loop Panda tracking demo: the end-effector maintains a constant relative pose to the moving box using the tracker output and PyBullet IK.
+
+![Closed-loop 3D trajectories](simulation/results/closed_loop_3d_trajectories.png)
+![Closed-loop relative error](simulation/results/closed_loop_relative_error.png)
+
+- Franka Panda closed-loop relative error: ~20mm steady state
+- End-effector orientation is locked downward throughout the run
+- Demo GIF is recorded from rendered PyBullet frames at 3x playback speed
 
 ---
 

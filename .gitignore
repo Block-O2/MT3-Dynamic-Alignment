@@ -16,3 +16,6 @@ __pycache__/
 # 虚拟环境（若有）
 .venv/
 env/
+
+# 辅助脚本
+simulation/01_hello_pybullet.py

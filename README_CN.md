@@ -1,9 +1,18 @@
 # MT3 动态对准扩展（Dynamic Alignment Extension）
 
+> **状态**：核心算法已实现，并通过合成数据与 PyBullet 仿真验证。Sawyer + RealSense D415 硬件验证进行中。
+>
 > 将 MT3 的一次性静态 GICP 对准扩展为**连续追踪**，让机械臂用单次静态示教即可抓取移动物体。
 >
 > 硬件背景：Sawyer 7-DOF 机械臂 + RealSense D415（头部固定）。
 > 纯 Python，无 ROS 依赖，无训练，全程解析可解释。
+
+## 演示
+
+![Franka Panda 在 PyBullet 仿真中追踪移动物体](simulation/results/demo.gif)
+
+*Franka Panda 末端跟踪移动方块（圆周轨迹，R=0.15m，ω=0.3 rad/s）。
+稳态相对误差：约 20mm。无需重新训练。*
 
 ---
 
@@ -298,6 +307,15 @@ CVModel 在三种运动模式下均能有效追踪，估计轨迹（橙色虚线
 - 稳态追踪误差：**4–5 mm**（与 D415 噪声水平一致）
 - 冷启动收敛时间：约 1 秒
 - 仿真使用真实深度图渲染，不是合成噪声
+
+Franka Panda 闭环追踪演示：末端根据 tracker 输出和 PyBullet IK 控制，保持与移动方块的固定相对位姿。
+
+![闭环 3D 轨迹](simulation/results/closed_loop_3d_trajectories.png)
+![闭环相对误差](simulation/results/closed_loop_relative_error.png)
+
+- Franka Panda 闭环稳态相对误差：约 20mm
+- 运行过程中末端姿态固定为竖直向下
+- Demo GIF 由 PyBullet 渲染帧生成，并以 3x 速度播放
 
 ---
 
