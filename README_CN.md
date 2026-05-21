@@ -338,6 +338,14 @@ Franka Panda 闭环追踪演示：末端根据 tracker 输出和 PyBullet IK 控
 系统在最高 6 cm/s 时仍保持 **>94% 成功率**，并在设计工作上限（10 cm/s）处平滑下降到 87%。
 在工作范围内没有突发失效。误差棒表示 3 次 trial 的方差。
 
+### 运动类型对比
+
+![运动类型对比](simulation/results/motion_type_comparison.png)
+
+Circular（94.4%）和 Random（96.0%）运动都明显超过 80% 阈值。
+Linear 往返运动（77.3%）略低于阈值，原因是转向点存在速度反向；这是 CV 预测在突发方向变化下的基本限制，
+也与人类运动控制在突然变向时面临的限制一致。
+
 - Franka Panda 闭环稳态相对误差：约 20mm
 - 运行过程中末端姿态固定为竖直向下
 - Demo GIF 由 PyBullet 渲染帧生成，并以 3x 速度播放

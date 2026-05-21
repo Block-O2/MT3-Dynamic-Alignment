@@ -339,6 +339,15 @@ System maintains **>94% success rate** up to 6 cm/s, with graceful degradation
 to 87% at the designed operating limit (10 cm/s). No abrupt failure within the
 operating range. Error bars represent variance across 3 trials.
 
+### Motion Type Comparison
+
+![Motion Type Comparison](simulation/results/motion_type_comparison.png)
+
+Circular (94.4%) and Random (96.0%) motions exceed the 80% threshold comfortably.
+Linear back-and-forth (77.3%) falls slightly below due to velocity reversal at
+turning points — a fundamental limitation of CV prediction shared with human motor
+control under sudden direction changes.
+
 - Franka Panda closed-loop relative error: ~20mm steady state
 - End-effector orientation is locked downward throughout the run
 - Demo GIF is recorded from rendered PyBullet frames at 3x playback speed
