@@ -151,15 +151,14 @@ robot.set_cartesian_target(T_target)
 ### Create conda environment
 
 ```bash
-conda create -n mt3_plus python=3.11 numpy pytest -y
-conda activate mt3_plus
+conda create -n dynamic_mt3 python=3.11 numpy pytest -y
+conda activate dynamic_mt3
 ```
 
 ### Run tests
 
 ```bash
-cd MT3_Plus
-conda activate mt3_plus
+conda activate dynamic_mt3
 python -m pytest tests/ -v
 ```
 
@@ -286,6 +285,20 @@ Synthetic test scenario: R = 0.3m, ω = 0.2 rad/s (v = 6cm/s), camera 30Hz, τ =
 | Phase transition jump | 0 (mathematically guaranteed continuous) | See `test_alignment_interaction_switch_no_jump` |
 
 > **Note**: Synthetic point cloud noise is higher than real D415 (design target 3–5mm position noise). In real deployment, D415 point cloud is denser with different noise structure; actual accuracy expected to exceed synthetic test results.
+
+---
+
+## Simulation Results
+
+Validated in PyBullet simulation: a box moving in a circle (R=0.3m, ω=0.3 rad/s) on a flat surface,
+observed via a virtual overhead RGB-D camera.
+
+![XY Trajectory](simulation/results/trajectory_xy.png)
+![Position Error](simulation/results/position_error.png)
+
+- Steady-state tracking error: **4–5 mm** (consistent with D415 noise level)
+- Cold-start convergence: ~1 second
+- Simulation uses real depth image rendering, not synthetic noise
 
 ---
 
