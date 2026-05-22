@@ -53,6 +53,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dynamic_alignment.pose_estimator import EstimatorConfig
 from dynamic_alignment.tracker import DynamicAlignmentTracker
+from dynamic_alignment.motion_models import CTModel
 from dynamic_alignment.types import DemoData
 
 
@@ -118,6 +119,7 @@ RECORD_REPRESENTATIVE_SPEED_CM_S = 4.0
 RECORD_REPRESENTATIVE_TRIAL = 0
 DEBUG_ADAPTIVE_GATE = False
 DEBUG_CONTACT_WINDOW = False
+TRACKING_METRIC_WARMUP_S = 1.0
 
 
 class GraspDemo(NamedTuple):
@@ -139,6 +141,22 @@ class TrialResult(NamedTuple):
     contact_position_error_mm: float
     orientation_error_deg: float
     approach_max_error_mm: float
+    mean_tracking_error_pre_contact_mm: float = float("nan")
+    mean_tracking_error_after_warmup_mm: float = float("nan")
+    contact_tracking_error_mm: float = float("nan")
+    max_tracking_error_mm: float = float("nan")
+    mean_object_estimation_error_xy_mm: float = float("nan")
+    mean_target_to_desired_demo_frame_error_xy_mm: float = float("nan")
+    mean_target_to_object_contact_offset_error_mm: float = float("nan")
+    mean_ee_to_target_error_pre_contact_mm: float = float("nan")
+    mean_ee_to_target_error_contact_window_mm: float = float("nan")
+    max_ee_to_target_error_mm: float = float("nan")
+    mean_ee_to_target_error_3d_pre_contact_mm: float = float("nan")
+    contact_window_ee_to_object_xy_mm: float = float("nan")
+    contact_window_ee_to_target_xy_mm: float = float("nan")
+    contact_window_target_to_object_xy_mm: float = float("nan")
+    gripper_close_sim_t: float = float("nan")
+    gripper_close_t_demo: float = float("nan")
 
 
 def moving_box_position(t: float, speed_cm_s: float) -> np.ndarray:
@@ -365,15 +383,22 @@ def is_descent_phase(demo_data: DemoData, t_demo: float) -> bool:
     return z_now < z_prev - 1e-6
 
 
-def make_tracker(reference_cloud: np.ndarray) -> DynamicAlignmentTracker:
+def make_tracker(reference_cloud: np.ndarray, motion_model: str = "cv") -> DynamicAlignmentTracker:
     """Create DynamicAlignmentTracker with the same settings as MT3 replay scripts."""
     estimator_config = EstimatorConfig(
         min_points=20,
         use_pca_angle=False,
         z_plane_threshold=0.03,
     )
+    if motion_model == "cv":
+        model = None
+    elif motion_model == "ct":
+        model = CTModel()
+    else:
+        raise ValueError(f"Unknown motion model: {motion_model}")
     tracker = DynamicAlignmentTracker(
         tau=TAU,
+        motion_model=model,
         estimator_config=estimator_config,
         kalman_R_diag=np.array([0.004, 0.004, math.radians(30.0)]),
         init_vel_cov=0.10,
@@ -464,10 +489,14 @@ def smooth_append(values: list[float], value: float, window_size: int) -> float:
     return float(np.mean(values))
 
 
-def reset_adaptive_replay_state(tracker: DynamicAlignmentTracker, demo_clock: list[float]) -> None:
+def reset_adaptive_replay_state(
+    tracker: DynamicAlignmentTracker | None,
+    demo_clock: list[float],
+) -> None:
     """Reset adaptive demo replay state after an aborted grasp attempt."""
     demo_clock[0] = 0.0
-    tracker._adaptive_last_t_demo = None
+    if tracker is not None:
+        tracker._adaptive_last_t_demo = None
 
 
 def make_video_camera_matrices() -> tuple[list[float], list[float]]:
@@ -549,8 +578,15 @@ def run_trial(
     moving_object: bool,
     trial_idx: int,
     record_gif: bool = False,
+    replay_mode: str = "dynamic_cv",
+    diagnostics_path: Path | None = None,
+    condition_label: str | None = None,
+    seed: int = SEED,
 ) -> TrialResult:
     """Run one static-baseline or moving-object grasp trial."""
+    if replay_mode not in {"dynamic_cv", "dynamic_tau0", "dynamic_ct", "static_replay"}:
+        raise ValueError(f"Unknown replay_mode: {replay_mode}")
+
     client_id = p.connect(p.GUI if USE_GUI else p.DIRECT)
     if client_id < 0:
         raise RuntimeError("Failed to connect to PyBullet")
@@ -583,7 +619,13 @@ def run_trial(
         for _ in range(30):
             command_and_step(panda_id, STATIC_BOX_POS + START_OFFSET, ik_params, OPEN_GRIPPER)
 
-        tracker = make_tracker(reference_cloud)
+        tracker = None
+        if replay_mode != "static_replay":
+            tracker = make_tracker(
+                reference_cloud,
+                motion_model="ct" if replay_mode == "dynamic_ct" else "cv",
+            )
+        replay_tau = 0.0 if replay_mode == "dynamic_tau0" else TAU
         constraint_id: int | None = None
         max_box_z = float(STATIC_BOX_POS[2])
         final_box_z = float(STATIC_BOX_POS[2])
@@ -598,6 +640,18 @@ def run_trial(
         attempts_used = 1
         lateral_error_window: list[float] = []
         demo_target_error_window: list[float] = []
+        tracking_errors_mm: list[tuple[float, float]] = []
+        contact_tracking_error_mm = float("nan")
+        target_to_desired_errors_xy_mm: list[float] = []
+        target_to_contact_offset_errors_mm: list[float] = []
+        ee_to_target_errors_xy_mm: list[tuple[float, float]] = []
+        ee_to_target_errors_3d_mm: list[tuple[float, float]] = []
+        contact_window_ee_to_object_xy_values: list[float] = []
+        contact_window_ee_to_target_xy_values: list[float] = []
+        contact_window_target_to_object_xy_values: list[float] = []
+        gripper_close_sim_t = float("nan")
+        gripper_close_t_demo = float("nan")
+        diagnostic_rows: list[dict[str, object]] = []
         aborted_by_attempt_limit = False
 
         n_steps = int(REPLAY_DURATION * sim03.FPS)
@@ -618,12 +672,32 @@ def run_trial(
                 if frame_idx == 0:
                     target_pose = demo.poses.get_pose_at(demo_clock[0])
                     lateral_error_mm = 0.0
+                elif replay_mode == "static_replay":
+                    demo_clock[0] = min(demo_clock[0] + sim03.DT, demo.poses.duration)
+                    target_pose = demo.poses.get_pose_at(demo_clock[0])
                 else:
-                    tracker.update(cloud, timestamp=replay_t)
+                    assert tracker is not None
+                    state = tracker.update(cloud, timestamp=replay_t)
+                    if constraint_id is None:
+                        expected_box_pos = moving_box_position(
+                            replay_t + trial_idx * 0.17,
+                            speed_cm_s,
+                        )
+                        true_delta_xy = np.asarray(
+                            expected_box_pos[:2] - STATIC_BOX_POS[:2],
+                            dtype=float,
+                        )
+                        estimated_delta_xy = np.array([state.delta_x, state.delta_y], dtype=float)
+                        tracking_errors_mm.append(
+                            (
+                                replay_t,
+                                float(np.linalg.norm(estimated_delta_xy - true_delta_xy) * 1000.0),
+                            )
+                        )
                     alignment_pose = tracker.get_target_pose(
                         demo.poses,
                         t_demo=0.0,
-                        tau=TAU,
+                        tau=replay_tau,
                     )
                     alignment_target = np.asarray(alignment_pose[:3, 3], dtype=float)
                     lateral_error_mm = float(
@@ -646,7 +720,7 @@ def run_trial(
                         t_demo=demo_clock,
                         lateral_error_mm=smoothed_lateral_error_mm,
                         threshold_mm=adaptive_threshold_mm,
-                        tau=TAU,
+                        tau=replay_tau,
                     )
                     frame_progress_rate = tracker._adaptive_progress_sum - previous_progress_sum
                     if DEBUG_ADAPTIVE_GATE and frame_idx % 30 == 0:
@@ -665,6 +739,9 @@ def run_trial(
                 target_pose = demo.poses.get_pose_at(t_demo)
 
             gripper_width = gripper_width_from_demo(demo, t_demo)
+            if gripper_width < OPEN_GRIPPER and not np.isfinite(gripper_close_sim_t):
+                gripper_close_sim_t = replay_t
+                gripper_close_t_demo = t_demo
             if moving_object and constraint_id is None and gripper_width < OPEN_GRIPPER:
                 ee_pos_before_close = sim03.get_ee_position(panda_id)
                 box_pos_before_close = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
@@ -685,11 +762,15 @@ def run_trial(
                     approach_errors_xy.clear()
                     lateral_error_window.clear()
                     demo_target_error_window.clear()
-                    target_pose = tracker.get_target_pose(
-                        demo.poses,
-                        t_demo=0.0,
-                        tau=TAU,
-                    )
+                    if replay_mode == "static_replay":
+                        target_pose = demo.poses.get_pose_at(0.0)
+                    else:
+                        assert tracker is not None
+                        target_pose = tracker.get_target_pose(
+                            demo.poses,
+                            t_demo=0.0,
+                            tau=replay_tau,
+                        )
                     command_and_step(
                         panda_id,
                         np.asarray(target_pose[:3, 3], dtype=float),
@@ -709,6 +790,7 @@ def run_trial(
             box_pos_after_step = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
             target_pos_after_step = np.asarray(target_pose[:3, 3], dtype=float)
             ee_to_target_mm = float(np.linalg.norm((ee_pos - target_pos_after_step)[:2]) * 1000.0)
+            ee_to_target_3d_mm = float(np.linalg.norm(ee_pos - target_pos_after_step) * 1000.0)
             horizontal_error = float(np.linalg.norm((ee_pos - box_pos_after_step)[:2]))
             demo_target_error = ee_to_target_mm / 1000.0
             smoothed_demo_target_error = smooth_append(
@@ -717,6 +799,89 @@ def run_trial(
                 LATERAL_ERROR_SMOOTHING_FRAMES,
             )
             approach_errors_xy.append((replay_t, smoothed_demo_target_error))
+
+            if constraint_id is None:
+                expected_box_pos = (
+                    moving_box_position(replay_t + trial_idx * 0.17, speed_cm_s)
+                    if moving_object
+                    else STATIC_BOX_POS
+                )
+                demo_pose_now = demo.poses.get_pose_at(t_demo)
+                desired_relative = demo_pose_now[:3, 3] - STATIC_BOX_POS
+                desired_dynamic_target = expected_box_pos + desired_relative
+                target_to_desired_errors_xy_mm.append(
+                    float(np.linalg.norm((target_pos_after_step - desired_dynamic_target)[:2]) * 1000.0)
+                )
+                target_to_contact_offset_errors_mm.append(
+                    float(
+                        np.linalg.norm(
+                            (target_pos_after_step - (expected_box_pos + CONTACT_OFFSET))[:2]
+                        )
+                        * 1000.0
+                    )
+                )
+                ee_to_target_errors_xy_mm.append((replay_t, ee_to_target_mm))
+                ee_to_target_errors_3d_mm.append((replay_t, ee_to_target_3d_mm))
+
+                if should_log_contact_window(t_demo):
+                    contact_window_ee_to_object_xy_values.append(horizontal_error * 1000.0)
+                    contact_window_ee_to_target_xy_values.append(ee_to_target_mm)
+                    contact_window_target_to_object_xy_values.append(
+                        float(np.linalg.norm((target_pos_after_step - box_pos_after_step)[:2]) * 1000.0)
+                    )
+
+            if diagnostics_path is not None:
+                object_est_x = float("nan")
+                object_est_y = float("nan")
+                object_estimation_error_xy_mm = float("nan")
+                if tracker is not None and tracker.current_state is not None:
+                    current_state = tracker.current_state
+                    object_est_x = float(STATIC_BOX_POS[0] + current_state.delta_x)
+                    object_est_y = float(STATIC_BOX_POS[1] + current_state.delta_y)
+                    expected_box_for_diag = (
+                        moving_box_position(replay_t + trial_idx * 0.17, speed_cm_s)
+                        if moving_object and constraint_id is None
+                        else box_pos_after_step
+                    )
+                    object_estimation_error_xy_mm = float(
+                        np.linalg.norm(
+                            np.array([object_est_x, object_est_y]) - expected_box_for_diag[:2]
+                        )
+                        * 1000.0
+                    )
+                diagnostic_rows.append(
+                    {
+                        "frame_idx": frame_idx,
+                        "sim_t": replay_t,
+                        "condition": condition_label or replay_mode,
+                        "speed_cm_s": speed_cm_s,
+                        "trial": trial_idx + 1,
+                        "seed": seed,
+                        "t_demo": t_demo,
+                        "replay_phase": "moving" if moving_object else "static",
+                        "gripper_width": gripper_width,
+                        "object_gt_x": box_pos_after_step[0],
+                        "object_gt_y": box_pos_after_step[1],
+                        "object_est_x": object_est_x,
+                        "object_est_y": object_est_y,
+                        "target_x": target_pos_after_step[0],
+                        "target_y": target_pos_after_step[1],
+                        "target_z": target_pos_after_step[2],
+                        "ee_x": ee_pos[0],
+                        "ee_y": ee_pos[1],
+                        "ee_z": ee_pos[2],
+                        "ee_to_target_xy_mm": ee_to_target_mm,
+                        "ee_to_target_3d_mm": ee_to_target_3d_mm,
+                        "ee_to_object_xy_mm": horizontal_error * 1000.0,
+                        "target_to_object_xy_mm": float(
+                            np.linalg.norm((target_pos_after_step - box_pos_after_step)[:2]) * 1000.0
+                        ),
+                        "object_estimation_error_xy_mm": object_estimation_error_xy_mm,
+                        "gripper_phase": gripper_phase(t_demo),
+                        "contact_event": 0,
+                        "attempt_index": attempts_used,
+                    }
+                )
 
             if moving_object and DEBUG_CONTACT_WINDOW and should_log_contact_window(t_demo):
                 print(
@@ -735,6 +900,10 @@ def run_trial(
             constraint_id = maybe_attach_box(panda_id, box_id, gripper_width, constraint_id)
             if previous_constraint_id is None and constraint_id is not None:
                 contact_position_error_mm = ee_to_target_mm
+                if tracking_errors_mm:
+                    contact_tracking_error_mm = tracking_errors_mm[-1][1]
+                if diagnostic_rows:
+                    diagnostic_rows[-1]["contact_event"] = 1
                 orientation_error_deg = gripper_axis_alignment_error_deg(panda_id)
                 approach_success, approach_max_error_mm = approach_is_consistent(
                     approach_errors_xy,
@@ -755,16 +924,71 @@ def run_trial(
 
     if record_gif:
         save_demo_gif(gif_frames, plot_dir / "grasping_demo.gif")
+    if diagnostics_path is not None:
+        diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "frame_idx",
+            "sim_t",
+            "condition",
+            "speed_cm_s",
+            "trial",
+            "seed",
+            "t_demo",
+            "replay_phase",
+            "gripper_width",
+            "object_gt_x",
+            "object_gt_y",
+            "object_est_x",
+            "object_est_y",
+            "target_x",
+            "target_y",
+            "target_z",
+            "ee_x",
+            "ee_y",
+            "ee_z",
+            "ee_to_target_xy_mm",
+            "ee_to_target_3d_mm",
+            "ee_to_object_xy_mm",
+            "target_to_object_xy_mm",
+            "object_estimation_error_xy_mm",
+            "gripper_phase",
+            "contact_event",
+            "attempt_index",
+        ]
+        with diagnostics_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(diagnostic_rows)
 
     final_lift_m = final_box_z - float(STATIC_BOX_POS[2])
     max_lift_m = max_box_z - float(STATIC_BOX_POS[2])
     lift_success = final_lift_m > LIFT_SUCCESS_MARGIN
     success = lift_success and position_success and orientation_success and approach_success
+    progress_rate = 1.0
+    if moving_object and tracker is not None:
+        progress_rate = tracker.progress_rate
+    tracking_values = np.array([value for _, value in tracking_errors_mm], dtype=float)
+    warmup_tracking_values = np.array(
+        [value for timestamp, value in tracking_errors_mm if timestamp >= TRACKING_METRIC_WARMUP_S],
+        dtype=float,
+    )
+    mean_tracking_error_pre_contact_mm = (
+        float(np.mean(tracking_values)) if tracking_values.size else float("nan")
+    )
+    mean_tracking_error_after_warmup_mm = (
+        float(np.mean(warmup_tracking_values)) if warmup_tracking_values.size else float("nan")
+    )
+    max_tracking_error_mm = (
+        float(np.max(tracking_values)) if tracking_values.size else float("nan")
+    )
+    ee_to_target_values = np.array([value for _, value in ee_to_target_errors_xy_mm], dtype=float)
+    ee_to_target_3d_values = np.array([value for _, value in ee_to_target_errors_3d_mm], dtype=float)
+    contact_window_ee_to_target = np.asarray(contact_window_ee_to_target_xy_values, dtype=float)
     return TrialResult(
         success=success,
         final_lift_m=final_lift_m,
         max_lift_m=max_lift_m,
-        progress_rate=tracker.progress_rate if moving_object else 1.0,
+        progress_rate=progress_rate,
         lift_success=lift_success,
         position_success=position_success,
         orientation_success=orientation_success,
@@ -774,6 +998,52 @@ def run_trial(
         contact_position_error_mm=contact_position_error_mm,
         orientation_error_deg=orientation_error_deg,
         approach_max_error_mm=approach_max_error_mm,
+        mean_tracking_error_pre_contact_mm=mean_tracking_error_pre_contact_mm,
+        mean_tracking_error_after_warmup_mm=mean_tracking_error_after_warmup_mm,
+        contact_tracking_error_mm=contact_tracking_error_mm,
+        max_tracking_error_mm=max_tracking_error_mm,
+        mean_object_estimation_error_xy_mm=mean_tracking_error_pre_contact_mm,
+        mean_target_to_desired_demo_frame_error_xy_mm=(
+            float(np.mean(target_to_desired_errors_xy_mm))
+            if target_to_desired_errors_xy_mm
+            else float("nan")
+        ),
+        mean_target_to_object_contact_offset_error_mm=(
+            float(np.mean(target_to_contact_offset_errors_mm))
+            if target_to_contact_offset_errors_mm
+            else float("nan")
+        ),
+        mean_ee_to_target_error_pre_contact_mm=(
+            float(np.mean(ee_to_target_values)) if ee_to_target_values.size else float("nan")
+        ),
+        mean_ee_to_target_error_contact_window_mm=(
+            float(np.mean(contact_window_ee_to_target))
+            if contact_window_ee_to_target.size
+            else float("nan")
+        ),
+        max_ee_to_target_error_mm=(
+            float(np.max(ee_to_target_values)) if ee_to_target_values.size else float("nan")
+        ),
+        mean_ee_to_target_error_3d_pre_contact_mm=(
+            float(np.mean(ee_to_target_3d_values)) if ee_to_target_3d_values.size else float("nan")
+        ),
+        contact_window_ee_to_object_xy_mm=(
+            float(np.mean(contact_window_ee_to_object_xy_values))
+            if contact_window_ee_to_object_xy_values
+            else float("nan")
+        ),
+        contact_window_ee_to_target_xy_mm=(
+            float(np.mean(contact_window_ee_to_target_xy_values))
+            if contact_window_ee_to_target_xy_values
+            else float("nan")
+        ),
+        contact_window_target_to_object_xy_mm=(
+            float(np.mean(contact_window_target_to_object_xy_values))
+            if contact_window_target_to_object_xy_values
+            else float("nan")
+        ),
+        gripper_close_sim_t=gripper_close_sim_t,
+        gripper_close_t_demo=gripper_close_t_demo,
     )
 
 

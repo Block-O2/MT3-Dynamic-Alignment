@@ -1,0 +1,23 @@
+# Results Directory
+
+This directory keeps reproducible simulation outputs separate from intermediate development runs.
+
+## Canonical Results
+
+`canonical/formal_baseline/` contains the current main formal baseline result. It preserves the command, git metadata, config, raw trial CSV, summary CSV, and analysis for the 160-trial Stage 3 formal baseline.
+
+Use this folder as the source of record for the current baseline conclusion.
+
+## Consolidated Summary
+
+`STAGE3_FORMAL_BASELINE_SUMMARY.md` contains the consolidated Stage 2 through formal-baseline summary. It explains which earlier smoke, audit, pilot, metric-diagnostic, and schema runs were superseded, which metrics are primary, which metrics are diagnostics-only, and what the formal baseline supports.
+
+## Intermediate Runs
+
+`experiments/` is treated as scratch/intermediate output. Future routine runs should be written there during development, but they should not be committed unless explicitly promoted to `canonical/`.
+
+`archive/` and `scratch/` are also reserved for non-canonical results and are ignored by git.
+
+## Scientific Scope
+
+These results are simulation-only PyBullet results. They do not validate real robot behavior, RealSense perception, real contact dynamics, or a full dynamic MT3 extension.
