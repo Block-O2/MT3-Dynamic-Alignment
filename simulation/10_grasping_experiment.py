@@ -149,6 +149,7 @@ class TrialResult(NamedTuple):
     mean_target_to_desired_demo_frame_error_xy_mm: float = float("nan")
     mean_target_to_object_contact_offset_error_mm: float = float("nan")
     mean_ee_to_target_error_pre_contact_mm: float = float("nan")
+    mean_ee_to_target_error_after_warmup_mm: float = float("nan")
     mean_ee_to_target_error_contact_window_mm: float = float("nan")
     max_ee_to_target_error_mm: float = float("nan")
     mean_ee_to_target_error_3d_pre_contact_mm: float = float("nan")
@@ -579,6 +580,8 @@ def run_trial(
     trial_idx: int,
     record_gif: bool = False,
     replay_mode: str = "dynamic_cv",
+    replay_tau: float | None = None,
+    observation_delay_s: float = 0.0,
     diagnostics_path: Path | None = None,
     condition_label: str | None = None,
     seed: int = SEED,
@@ -586,6 +589,8 @@ def run_trial(
     """Run one static-baseline or moving-object grasp trial."""
     if replay_mode not in {"dynamic_cv", "dynamic_tau0", "dynamic_ct", "static_replay"}:
         raise ValueError(f"Unknown replay_mode: {replay_mode}")
+    if observation_delay_s < 0:
+        raise ValueError("observation_delay_s must be non-negative")
 
     client_id = p.connect(p.GUI if USE_GUI else p.DIRECT)
     if client_id < 0:
@@ -625,7 +630,9 @@ def run_trial(
                 reference_cloud,
                 motion_model="ct" if replay_mode == "dynamic_ct" else "cv",
             )
-        replay_tau = 0.0 if replay_mode == "dynamic_tau0" else TAU
+        if replay_tau is None:
+            replay_tau = 0.0 if replay_mode == "dynamic_tau0" else TAU
+        replay_tau = float(replay_tau)
         constraint_id: int | None = None
         max_box_z = float(STATIC_BOX_POS[2])
         final_box_z = float(STATIC_BOX_POS[2])
@@ -668,7 +675,31 @@ def run_trial(
 
             if moving_object:
                 ee_pos_before_command = sim03.get_ee_position(panda_id)
-                cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
+                cloud_time = max(0.0, replay_t - observation_delay_s)
+                if observation_delay_s > 0.0 and constraint_id is None:
+                    delayed_box_pos = moving_box_position(
+                        cloud_time + trial_idx * 0.17,
+                        speed_cm_s,
+                    )
+                    p.resetBasePositionAndOrientation(
+                        box_id,
+                        delayed_box_pos.tolist(),
+                        [0.0, 0.0, 0.0, 1.0],
+                    )
+                    p.resetBaseVelocity(box_id, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+                    cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
+                    current_box_pos = moving_box_position(
+                        replay_t + trial_idx * 0.17,
+                        speed_cm_s,
+                    )
+                    p.resetBasePositionAndOrientation(
+                        box_id,
+                        current_box_pos.tolist(),
+                        [0.0, 0.0, 0.0, 1.0],
+                    )
+                    p.resetBaseVelocity(box_id, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+                else:
+                    cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
                 if frame_idx == 0:
                     target_pose = demo.poses.get_pose_at(demo_clock[0])
                     lateral_error_mm = 0.0
@@ -880,6 +911,8 @@ def run_trial(
                         "gripper_phase": gripper_phase(t_demo),
                         "contact_event": 0,
                         "attempt_index": attempts_used,
+                        "observation_delay_s": observation_delay_s,
+                        "observation_time": cloud_time,
                     }
                 )
 
@@ -954,6 +987,8 @@ def run_trial(
             "gripper_phase",
             "contact_event",
             "attempt_index",
+            "observation_delay_s",
+            "observation_time",
         ]
         with diagnostics_path.open("w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -982,6 +1017,14 @@ def run_trial(
         float(np.max(tracking_values)) if tracking_values.size else float("nan")
     )
     ee_to_target_values = np.array([value for _, value in ee_to_target_errors_xy_mm], dtype=float)
+    ee_to_target_after_warmup_values = np.array(
+        [
+            value
+            for timestamp, value in ee_to_target_errors_xy_mm
+            if timestamp >= TRACKING_METRIC_WARMUP_S
+        ],
+        dtype=float,
+    )
     ee_to_target_3d_values = np.array([value for _, value in ee_to_target_errors_3d_mm], dtype=float)
     contact_window_ee_to_target = np.asarray(contact_window_ee_to_target_xy_values, dtype=float)
     return TrialResult(
@@ -1015,6 +1058,11 @@ def run_trial(
         ),
         mean_ee_to_target_error_pre_contact_mm=(
             float(np.mean(ee_to_target_values)) if ee_to_target_values.size else float("nan")
+        ),
+        mean_ee_to_target_error_after_warmup_mm=(
+            float(np.mean(ee_to_target_after_warmup_values))
+            if ee_to_target_after_warmup_values.size
+            else float("nan")
         ),
         mean_ee_to_target_error_contact_window_mm=(
             float(np.mean(contact_window_ee_to_target))

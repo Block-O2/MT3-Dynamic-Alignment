@@ -111,6 +111,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--record-gif", action="store_true")
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--record-diagnostics", action="store_true")
+    parser.add_argument(
+        "--latency-validation",
+        action="store_true",
+        help="Generate dynamic_delay{ms}_tau{ms} CV replay conditions from delay/tau grids.",
+    )
+    parser.add_argument(
+        "--observation-delay-ms",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Artificial observation delays in milliseconds for latency validation.",
+    )
+    parser.add_argument(
+        "--tau-values",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Prediction horizons in seconds for latency validation.",
+    )
     return parser
 
 
@@ -154,15 +173,26 @@ def write_command(path: Path) -> None:
     path.write_text(" ".join([sys.executable, *sys.argv]) + "\n", encoding="utf-8")
 
 
-def config_from_args(args: argparse.Namespace, grasp) -> dict:
+def config_from_args(args: argparse.Namespace, grasp, trial_specs: list[dict] | None = None) -> dict:
     return {
         "stage_name": args.stage_name,
         "conditions": args.conditions,
+        "generated_trial_conditions": trial_specs or [],
         "condition_definitions": {name: AVAILABLE_CONDITIONS[name] for name in args.conditions},
         "speeds_cm_s": args.speeds,
         "trials": args.trials,
         "seed": args.seed,
         "record_diagnostics": bool(args.record_diagnostics),
+        "latency_validation": bool(args.latency_validation),
+        "observation_delay_ms": args.observation_delay_ms,
+        "tau_values_s": args.tau_values,
+        "delay_implementation": (
+            "When latency validation is enabled, each tracker point-cloud observation is captured "
+            "from the deterministic object pose at max(0, sim_t - observation_delay_s). The object is "
+            "then immediately restored to the current sim_t pose before target execution and contact checks. "
+            "Tracker timestamps remain the current controller time, so the estimate is intentionally spatially "
+            "lagged while the physical object continues moving at the current simulation time."
+        ),
         "core_method_unchanged": True,
         "same_robot_object_trajectory_controller_thresholds": True,
         "tau_note": (
@@ -191,6 +221,8 @@ RAW_FIELDS = [
     "trial",
     "seed",
     "tau",
+    "observation_delay_ms",
+    "tau_delay_error_ms",
     "success",
     "lift_mm",
     "mean_tracking_error_pre_contact_mm",
@@ -201,9 +233,12 @@ RAW_FIELDS = [
     "object_estimation_error_theta_deg",
     "target_to_desired_demo_frame_error_xy_mm",
     "target_to_object_contact_offset_error_mm",
+    "mean_latency_tracking_error_mm",
+    "mean_target_lag_error_mm",
     "ee_to_target_error_xy_mm",
     "ee_to_target_error_3d_mm",
     "mean_ee_to_target_error_pre_contact_mm",
+    "mean_ee_to_target_error_after_warmup_mm",
     "mean_ee_to_target_error_contact_window_mm",
     "max_ee_to_target_error_mm",
     "contact_window_ee_to_object_xy_mm",
@@ -241,6 +276,8 @@ def append_raw_row(path: Path, row: dict) -> None:
     for key in [
         "speed_cm_s",
         "tau",
+        "observation_delay_ms",
+        "tau_delay_error_ms",
         "lift_mm",
         "mean_tracking_error_pre_contact_mm",
         "mean_tracking_error_after_warmup_mm",
@@ -250,9 +287,12 @@ def append_raw_row(path: Path, row: dict) -> None:
         "object_estimation_error_theta_deg",
         "target_to_desired_demo_frame_error_xy_mm",
         "target_to_object_contact_offset_error_mm",
+        "mean_latency_tracking_error_mm",
+        "mean_target_lag_error_mm",
         "ee_to_target_error_xy_mm",
         "ee_to_target_error_3d_mm",
         "mean_ee_to_target_error_pre_contact_mm",
+        "mean_ee_to_target_error_after_warmup_mm",
         "mean_ee_to_target_error_contact_window_mm",
         "max_ee_to_target_error_mm",
         "contact_window_ee_to_object_xy_mm",
@@ -284,6 +324,9 @@ def write_summary(path: Path, rows: list[dict]) -> None:
     fields = [
         "condition",
         "speed_cm_s",
+        "observation_delay_ms",
+        "tau",
+        "tau_delay_error_ms",
         "n_trials",
         "n_success",
         "n_failures",
@@ -295,18 +338,29 @@ def write_summary(path: Path, rows: list[dict]) -> None:
         "mean_contact_position_error_finite_only",
         "mean_ee_to_target_error_contact_window_finite_only",
         "mean_contact_window_ee_to_object_xy_finite_only",
+        "mean_latency_tracking_error_finite_only",
+        "mean_target_lag_error_finite_only",
+        "mean_ee_to_target_error_after_warmup_finite_only",
         "mean_orientation_error_finite_only",
         "mean_approach_error_finite_only",
         "main_failure_counts",
     ]
-    grouped: dict[tuple[str, float], list[dict]] = {}
+    grouped: dict[tuple[str, float, float, float], list[dict]] = {}
     for row in rows:
-        grouped.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
+        grouped.setdefault(
+            (
+                row["condition"],
+                row["speed_cm_s"],
+                row.get("observation_delay_ms", float("nan")),
+                row.get("tau", float("nan")),
+            ),
+            [],
+        ).append(row)
 
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
-        for (condition, speed), group in sorted(grouped.items()):
+        for (condition, speed, observation_delay_ms, tau), group in sorted(grouped.items()):
             failures: dict[str, int] = {}
             for row in group:
                 failures[row["main_failure"]] = failures.get(row["main_failure"], 0) + 1
@@ -324,6 +378,9 @@ def write_summary(path: Path, rows: list[dict]) -> None:
                 {
                     "condition": condition,
                     "speed_cm_s": f"{speed:.3f}",
+                    "observation_delay_ms": f"{observation_delay_ms:.3f}",
+                    "tau": f"{tau:.3f}",
+                    "tau_delay_error_ms": f"{(tau * 1000.0) - observation_delay_ms:.3f}",
                     "n_trials": len(group),
                     "n_success": n_success,
                     "n_failures": len(group) - n_success,
@@ -335,6 +392,9 @@ def write_summary(path: Path, rows: list[dict]) -> None:
                     "mean_contact_position_error_finite_only": f"{finite_mean(row['contact_position_error_mm'] for row in group):.3f}",
                     "mean_ee_to_target_error_contact_window_finite_only": f"{finite_mean(row['mean_ee_to_target_error_contact_window_mm'] for row in group):.3f}",
                     "mean_contact_window_ee_to_object_xy_finite_only": f"{finite_mean(row['contact_window_ee_to_object_xy_mm'] for row in group):.3f}",
+                    "mean_latency_tracking_error_finite_only": f"{finite_mean(row['mean_latency_tracking_error_mm'] for row in group):.3f}",
+                    "mean_target_lag_error_finite_only": f"{finite_mean(row['mean_target_lag_error_mm'] for row in group):.3f}",
+                    "mean_ee_to_target_error_after_warmup_finite_only": f"{finite_mean(row['mean_ee_to_target_error_after_warmup_mm'] for row in group):.3f}",
                     "mean_orientation_error_finite_only": f"{finite_mean(row['orientation_error_deg'] for row in group):.3f}",
                     "mean_approach_error_finite_only": f"{finite_mean(row['approach_error_mm'] for row in group):.3f}",
                     "main_failure_counts": json.dumps(failures, sort_keys=True),
@@ -342,15 +402,72 @@ def write_summary(path: Path, rows: list[dict]) -> None:
             )
 
 
+def tau_label(tau_s: float) -> str:
+    return str(int(round(float(tau_s) * 1000.0)))
+
+
+def delay_label(delay_ms: float) -> str:
+    return str(int(round(float(delay_ms))))
+
+
+def build_trial_specs(args: argparse.Namespace) -> tuple[list[dict], list[str]]:
+    """Return concrete trial specs without changing existing baseline condition meanings."""
+    if args.latency_validation:
+        delays_ms = args.observation_delay_ms if args.observation_delay_ms is not None else [0.0]
+        tau_values = args.tau_values if args.tau_values is not None else [0.0, 0.1]
+        specs = []
+        for delay_ms in delays_ms:
+            if delay_ms < 0:
+                raise ValueError("--observation-delay-ms values must be non-negative")
+            for tau_s in tau_values:
+                if tau_s < 0:
+                    raise ValueError("--tau-values values must be non-negative")
+                specs.append(
+                    {
+                        "condition": f"dynamic_delay{delay_label(delay_ms)}_tau{tau_label(tau_s)}",
+                        "replay_mode": "dynamic_cv",
+                        "tau": float(tau_s),
+                        "observation_delay_ms": float(delay_ms),
+                        "available": True,
+                        "description": "CV dynamic replay with artificial delayed object point-cloud observations.",
+                    }
+                )
+        return specs, []
+
+    specs = []
+    deferred = []
+    for condition in args.conditions:
+        info = AVAILABLE_CONDITIONS[condition]
+        if not info["available"]:
+            deferred.append(condition)
+            continue
+        specs.append(
+            {
+                "condition": condition,
+                "replay_mode": info["replay_mode"],
+                "tau": info["tau"],
+                "observation_delay_ms": 0.0,
+                "available": True,
+                "description": info["description"],
+            }
+        )
+    return specs, deferred
+
+
 def write_analysis(path: Path, args: argparse.Namespace, rows: list[dict], deferred: list[str], runtime_s: float, succeeded: bool) -> None:
     grouped: dict[tuple[str, float], list[dict]] = {}
     for row in rows:
         grouped.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
 
+    stage_description = (
+        "Stage 4A latency validation. The run injects artificial observation delay into tracker point-cloud observations while keeping the same robot, object trajectory, controller, thresholds, physics, retry logic, success criteria, and fixed-constraint behavior."
+        if args.latency_validation or "latency" in args.stage_name
+        else "Stage 3 baseline smoke test. The run keeps the same robot, object, trajectory, controller, thresholds, physics, and success criteria as the existing grasping experiment."
+    )
     lines = [
         f"# {args.stage_name}",
         "",
-        "Stage 3 baseline smoke test. The run keeps the same robot, object, trajectory, controller, thresholds, physics, and success criteria as the existing grasping experiment.",
+        stage_description,
         "tau is treated as the intended measured system-delay interface parameter, not tuned for success.",
         "",
         f"- status: {'succeeded' if succeeded else 'failed'}",
@@ -360,6 +477,8 @@ def write_analysis(path: Path, args: argparse.Namespace, rows: list[dict], defer
         f"- requested_conditions: {args.conditions}",
         f"- executed_conditions: {sorted(set(row['condition'] for row in rows))}",
         f"- deferred_conditions: {deferred}",
+        f"- observation_delay_ms: {args.observation_delay_ms}",
+        f"- tau_values_s: {args.tau_values}",
         "",
         "Important limitation: grasp attachment remains the existing deterministic fixed PyBullet constraint when the gripper closes near the box. This is not real contact or hardware validation.",
         "",
@@ -408,6 +527,8 @@ def write_analysis(path: Path, args: argparse.Namespace, rows: list[dict], defer
         )
     if "formal_baseline" in args.stage_name:
         lines.extend(formal_baseline_answers(rows))
+    if args.latency_validation or "latency" in args.stage_name:
+        lines.extend(latency_validation_answers(rows))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -511,6 +632,91 @@ def formal_baseline_answers(rows: list[dict]) -> list[str]:
         "",
         recommendation,
     ]
+
+
+def latency_validation_answers(rows: list[dict]) -> list[str]:
+    grouped: dict[tuple[float, float, float], list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(
+            (row["speed_cm_s"], row["observation_delay_ms"], row["tau"]),
+            [],
+        ).append(row)
+
+    def rate(speed: float, delay_ms: float, tau_s: float) -> float:
+        group = grouped.get((speed, delay_ms, tau_s), [])
+        return float(np.mean([row["success"] for row in group])) if group else float("nan")
+
+    delays = sorted({row["observation_delay_ms"] for row in rows})
+    speeds = sorted({row["speed_cm_s"] for row in rows})
+    taus = sorted({row["tau"] for row in rows})
+
+    matched_better_cases = 0
+    matched_cases = 0
+    delay0_tau0_better_or_equal = 0
+    delay0_cases = 0
+    for speed in speeds:
+        for delay_ms in delays:
+            matched_tau = delay_ms / 1000.0
+            if matched_tau in taus:
+                matched = rate(speed, delay_ms, matched_tau)
+                tau0 = rate(speed, delay_ms, 0.0)
+                if np.isfinite(matched) and np.isfinite(tau0):
+                    matched_cases += 1
+                    if matched > tau0:
+                        matched_better_cases += 1
+            if delay_ms == 0.0 and 0.0 in taus:
+                tau0 = rate(speed, delay_ms, 0.0)
+                other_rates = [rate(speed, delay_ms, tau) for tau in taus if tau != 0.0]
+                finite_other = [value for value in other_rates if np.isfinite(value)]
+                if finite_other:
+                    delay0_cases += 1
+                    if tau0 >= max(finite_other):
+                        delay0_tau0_better_or_equal += 1
+
+    if matched_cases and matched_better_cases == matched_cases:
+        recommendation = "TAU_VALID_UNDER_DELAY"
+    elif matched_cases and matched_better_cases == 0:
+        recommendation = "TAU_NOT_VALIDATED"
+    else:
+        recommendation = "TAU_NOT_VALIDATED"
+
+    lines = [
+        "",
+        "## Stage 4A Latency Validation Questions",
+        "",
+        "1. Was artificial observation delay implemented? What exactly is delayed?",
+        "Yes. For each tracker update, the object point cloud is captured from the deterministic object pose at max(0, sim_t - observation_delay_s). The object is immediately restored to the current sim_t pose before command execution and contact checks. The physical object trajectory, controller, thresholds, retry logic, success criteria, and fixed-constraint behavior are unchanged.",
+        "",
+        "2. Does tau=matching_delay improve over tau=0 when delay is injected?",
+        f"Matched tau had higher success than tau=0 in {matched_better_cases}/{matched_cases} comparable speed-delay cells. Interpret cautiously for smoke/pilot trial counts.",
+        "",
+        "3. Does tau=matching_delay perform better than mismatched tau?",
+        "See summary.csv by delay/tau condition. This analysis ranks primarily by success_rate, n_no_contact, and main_failure_counts, with finite-only contact-window metrics interpreted with counts.",
+        "",
+        "4. Does tau hurt or fail to help when delay=0?",
+        f"At delay=0, tau=0 was best or tied in {delay0_tau0_better_or_equal}/{delay0_cases} comparable speed cells.",
+        "",
+        "5. Is the latency-compensation effect stronger at higher speed?",
+        "This can only be judged from the 4 and 8 cm/s cells in this Stage 4A run; do not extrapolate beyond this grid.",
+        "",
+        "6. Does latency compensation reduce no-contact / attempt_limit failures?",
+        "Use n_no_contact and main_failure_counts in summary.csv. These remain the primary failure diagnostics.",
+        "",
+        "7. Are contact-window EE-to-target metrics improved by matched tau?",
+        "Use mean_ee_to_target_error_contact_window_finite_only together with n_finite_contact_error and n_no_contact. Finite-only means must not hide no-contact failures.",
+        "",
+        "8. Are results consistent with the original design note that tau is a measured delay-compensation parameter?",
+        "Only if matched tau improves delayed-observation cells without helping latency-free cells. This remains a PyBullet diagnostic, not hardware validation.",
+        "",
+        "9. Should tau remain enabled in future delayed simulations?",
+        "Only for simulations that explicitly inject or model observation delay close to the configured tau.",
+        "",
+        "10. Should tau remain off or be treated cautiously in latency-free PyBullet formal baselines?",
+        "Yes. The formal baseline showed tau=0.1 did not outperform tau=0 without injected delay, so tau should be treated cautiously in latency-free PyBullet runs.",
+        "",
+        recommendation,
+    ]
+    return lines
 
 
 def write_baseline_audit(path: Path) -> None:
@@ -812,17 +1018,32 @@ def log_condition_verification(conditions: list[str]) -> None:
     print("shared_setup: same object trajectory, controller, thresholds, success criteria, physics, and fixed-constraint behavior")
 
 
+def log_latency_verification(trial_specs: list[dict]) -> None:
+    print("latency_condition_verification:")
+    print("  motion_model=CVModel")
+    print("  tracker.update=true")
+    print("  get_target_pose=true")
+    print("  adaptive_replay=true")
+    print("  observation_delay_model=delayed point-cloud capture from deterministic object pose")
+    for spec in trial_specs:
+        print(
+            f"  {spec['condition']}: observation_delay_ms={spec['observation_delay_ms']:.1f}, "
+            f"tau={spec['tau']:.3f}s, tau_delay_error_ms={spec['tau'] * 1000.0 - spec['observation_delay_ms']:.1f}"
+        )
+    print("shared_setup: same object trajectory, controller, thresholds, success criteria, physics, retry logic, and fixed-constraint behavior")
+
+
 def run_one_trial(
     grasp,
-    condition: str,
+    trial_spec: dict,
     speed: float,
     trial_idx: int,
     seed: int,
     record_gif: bool,
     diagnostics_dir: Path | None,
 ) -> dict:
-    condition_info = AVAILABLE_CONDITIONS[condition]
-    if not condition_info["available"]:
+    condition = trial_spec["condition"]
+    if not trial_spec["available"]:
         raise RuntimeError(f"Condition {condition} is not available")
     random.seed(seed + trial_idx)
     np.random.seed(seed + trial_idx)
@@ -833,12 +1054,17 @@ def run_one_trial(
             diagnostics_dir
             / f"{condition}_speed{float(speed):.1f}_trial{trial_idx + 1}.csv"
         )
+    tau_value = trial_spec["tau"]
+    tau_for_row = float(tau_value) if tau_value is not None else float("nan")
+    observation_delay_ms = float(trial_spec.get("observation_delay_ms", 0.0))
     result = grasp.run_trial(
         speed_cm_s=float(speed),
         moving_object=True,
         trial_idx=trial_idx,
         record_gif=record_gif,
-        replay_mode=condition_info["replay_mode"],
+        replay_mode=trial_spec["replay_mode"],
+        replay_tau=tau_value,
+        observation_delay_s=observation_delay_ms / 1000.0,
         diagnostics_path=diagnostics_path,
         condition_label=condition,
         seed=seed,
@@ -849,7 +1075,9 @@ def run_one_trial(
         "speed_cm_s": float(speed),
         "trial": trial_idx + 1,
         "seed": seed,
-        "tau": condition_info["tau"],
+        "tau": tau_for_row,
+        "observation_delay_ms": observation_delay_ms,
+        "tau_delay_error_ms": float(tau_for_row * 1000.0 - observation_delay_ms),
         "success": bool(result.success),
         "lift_mm": float(result.final_lift_m * 1000.0),
         "mean_tracking_error_pre_contact_mm": float(result.mean_tracking_error_pre_contact_mm),
@@ -860,9 +1088,12 @@ def run_one_trial(
         "object_estimation_error_theta_deg": float("nan"),
         "target_to_desired_demo_frame_error_xy_mm": float(result.mean_target_to_desired_demo_frame_error_xy_mm),
         "target_to_object_contact_offset_error_mm": float(result.mean_target_to_object_contact_offset_error_mm),
+        "mean_latency_tracking_error_mm": float(result.mean_tracking_error_after_warmup_mm),
+        "mean_target_lag_error_mm": float(result.mean_target_to_desired_demo_frame_error_xy_mm),
         "ee_to_target_error_xy_mm": float(result.mean_ee_to_target_error_pre_contact_mm),
         "ee_to_target_error_3d_mm": float(result.mean_ee_to_target_error_3d_pre_contact_mm),
         "mean_ee_to_target_error_pre_contact_mm": float(result.mean_ee_to_target_error_pre_contact_mm),
+        "mean_ee_to_target_error_after_warmup_mm": float(result.mean_ee_to_target_error_after_warmup_mm),
         "mean_ee_to_target_error_contact_window_mm": float(result.mean_ee_to_target_error_contact_window_mm),
         "max_ee_to_target_error_mm": float(result.max_ee_to_target_error_mm),
         "contact_window_ee_to_object_xy_mm": float(result.contact_window_ee_to_object_xy_mm),
@@ -901,10 +1132,10 @@ def main() -> int:
     write_metric_definitions(out_dir / "metric_definitions.md")
 
     rows: list[dict] = []
-    deferred = [condition for condition in args.conditions if not AVAILABLE_CONDITIONS[condition]["available"]]
-    executable_conditions = [
-        condition for condition in args.conditions if AVAILABLE_CONDITIONS[condition]["available"]
-    ]
+    try:
+        trial_specs, deferred = build_trial_specs(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     succeeded = False
     start = time.perf_counter()
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -912,21 +1143,25 @@ def main() -> int:
             try:
                 grasp = load_grasping_module()
                 (out_dir / "config.json").write_text(
-                    json.dumps(config_from_args(args, grasp), indent=2, sort_keys=True) + "\n",
+                    json.dumps(config_from_args(args, grasp, trial_specs), indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
                 print(f"output_dir={out_dir}")
                 print(f"requested_conditions={args.conditions}")
-                print(f"executable_conditions={executable_conditions}")
+                print(f"executable_conditions={[spec['condition'] for spec in trial_specs]}")
                 print(f"deferred_conditions={deferred}")
                 print(f"speeds_cm_s={args.speeds}")
                 print(f"trials={args.trials}")
-                log_condition_verification(args.conditions)
+                if args.latency_validation:
+                    log_latency_verification(trial_specs)
+                else:
+                    log_condition_verification(args.conditions)
                 if args.audit_only:
                     print("audit_only=true; no trials executed")
                     succeeded = True
                     return 0
-                for condition in executable_conditions:
+                for trial_spec in trial_specs:
+                    condition = trial_spec["condition"]
                     for speed in args.speeds:
                         for trial_idx in range(args.trials):
                             print(
@@ -935,7 +1170,7 @@ def main() -> int:
                             )
                             row = run_one_trial(
                                 grasp,
-                                condition=condition,
+                                trial_spec=trial_spec,
                                 speed=float(speed),
                                 trial_idx=trial_idx,
                                 seed=args.seed,

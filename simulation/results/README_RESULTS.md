@@ -12,6 +12,8 @@ Use this folder as the source of record for the current baseline conclusion.
 
 `STAGE3_FORMAL_BASELINE_SUMMARY.md` contains the consolidated Stage 2 through formal-baseline summary. It explains which earlier smoke, audit, pilot, metric-diagnostic, and schema runs were superseded, which metrics are primary, which metrics are diagnostics-only, and what the formal baseline supports.
 
+`STAGE4A_LATENCY_VALIDATION_SUMMARY.md` contains the consolidated tau/latency validation summary. It records that `predict_ahead(tau)` is valid under synthetic constant-velocity assumptions, but was not validated in the current PyBullet observation-delay or control-delay tracking-only diagnostics. The current project direction is to stop tau tuning and proceed next to contact-aware temporal gating after approval.
+
 ## Intermediate Runs
 
 `experiments/` is treated as scratch/intermediate output. Future routine runs should be written there during development, but they should not be committed unless explicitly promoted to `canonical/`.
