@@ -120,6 +120,13 @@ RECORD_REPRESENTATIVE_TRIAL = 0
 DEBUG_ADAPTIVE_GATE = False
 DEBUG_CONTACT_WINDOW = False
 TRACKING_METRIC_WARMUP_S = 1.0
+CONTACT_GATE_EE_TO_TARGET_XY_THRESHOLD_MM = 12.0
+CONTACT_GATE_EE_TO_OBJECT_XY_THRESHOLD_MM = 35.0
+CONTACT_GATE_MAX_WAIT_S = 2.0
+CLOSE_TRIGGER_EE_TO_OBJECT_THRESHOLD_MM = 40.0
+CLOSE_TRIGGER_EE_TO_TARGET_THRESHOLD_MM = 25.0
+RETIME_WINDOW_BEFORE_CLOSE_S = 0.5
+RETIME_WINDOW_AFTER_CLOSE_S = 1.0
 
 
 class GraspDemo(NamedTuple):
@@ -158,6 +165,25 @@ class TrialResult(NamedTuple):
     contact_window_target_to_object_xy_mm: float = float("nan")
     gripper_close_sim_t: float = float("nan")
     gripper_close_t_demo: float = float("nan")
+    contact_gate_enabled: bool = False
+    contact_gate_passed: bool = False
+    contact_gate_timeout: bool = False
+    contact_gate_wait_s: float = 0.0
+    n_gate_freeze_frames: int = 0
+    gate_fail_reason: str = "disabled"
+    ee_to_target_at_gate_mm: float = float("nan")
+    ee_to_object_at_gate_mm: float = float("nan")
+    close_allowed_sim_t: float = float("nan")
+    close_allowed_t_demo: float = float("nan")
+    close_retime_enabled: bool = False
+    close_retime_triggered: bool = False
+    close_retime_timeout: bool = False
+    close_trigger_sim_t: float = float("nan")
+    close_trigger_t_demo: float = float("nan")
+    close_trigger_ee_to_object_mm: float = float("nan")
+    close_trigger_ee_to_target_mm: float = float("nan")
+    close_retime_wait_s: float = 0.0
+    close_retime_fail_reason: str = "disabled"
 
 
 def moving_box_position(t: float, speed_cm_s: float) -> np.ndarray:
@@ -582,7 +608,18 @@ def run_trial(
     replay_mode: str = "dynamic_cv",
     replay_tau: float | None = None,
     observation_delay_s: float = 0.0,
+    contact_gate_enabled: bool = False,
+    contact_gate_mode: str = "legacy",
+    contact_gate_ee_to_target_xy_threshold_mm: float = CONTACT_GATE_EE_TO_TARGET_XY_THRESHOLD_MM,
+    contact_gate_ee_to_object_xy_threshold_mm: float = CONTACT_GATE_EE_TO_OBJECT_XY_THRESHOLD_MM,
+    contact_gate_max_wait_s: float = CONTACT_GATE_MAX_WAIT_S,
+    close_retime_enabled: bool = False,
+    close_trigger_ee_to_object_threshold_mm: float = CLOSE_TRIGGER_EE_TO_OBJECT_THRESHOLD_MM,
+    close_trigger_ee_to_target_threshold_mm: float = CLOSE_TRIGGER_EE_TO_TARGET_THRESHOLD_MM,
+    retime_window_before_close_s: float = RETIME_WINDOW_BEFORE_CLOSE_S,
+    retime_window_after_close_s: float = RETIME_WINDOW_AFTER_CLOSE_S,
     diagnostics_path: Path | None = None,
+    attempt_diagnostics_path: Path | None = None,
     condition_label: str | None = None,
     seed: int = SEED,
 ) -> TrialResult:
@@ -591,6 +628,14 @@ def run_trial(
         raise ValueError(f"Unknown replay_mode: {replay_mode}")
     if observation_delay_s < 0:
         raise ValueError("observation_delay_s must be non-negative")
+    if contact_gate_mode not in {"legacy", "preclose"}:
+        raise ValueError(f"Unknown contact_gate_mode: {contact_gate_mode}")
+    if contact_gate_max_wait_s < 0:
+        raise ValueError("contact_gate_max_wait_s must be non-negative")
+    if close_trigger_ee_to_object_threshold_mm < 0 or close_trigger_ee_to_target_threshold_mm < 0:
+        raise ValueError("close trigger thresholds must be non-negative")
+    if retime_window_before_close_s < 0 or retime_window_after_close_s < 0:
+        raise ValueError("retime windows must be non-negative")
 
     client_id = p.connect(p.GUI if USE_GUI else p.DIRECT)
     if client_id < 0:
@@ -658,8 +703,32 @@ def run_trial(
         contact_window_target_to_object_xy_values: list[float] = []
         gripper_close_sim_t = float("nan")
         gripper_close_t_demo = float("nan")
+        gate_close_allowed = not contact_gate_enabled
+        contact_gate_passed = False
+        contact_gate_timeout = False
+        contact_gate_wait_s = 0.0
+        gate_wait_start_sim_t = float("nan")
+        n_gate_freeze_frames = 0
+        gate_fail_reason = "disabled" if not contact_gate_enabled else "not_reached"
+        ee_to_target_at_gate_mm = float("nan")
+        ee_to_object_at_gate_mm = float("nan")
+        close_allowed_sim_t = float("nan")
+        close_allowed_t_demo = float("nan")
+        close_retime_triggered = False
+        close_retime_timeout = False
+        close_trigger_sim_t = float("nan")
+        close_trigger_t_demo = float("nan")
+        close_trigger_ee_to_object_mm = float("nan")
+        close_trigger_ee_to_target_mm = float("nan")
+        close_retime_wait_s = 0.0
+        close_retime_fail_reason = "disabled" if not close_retime_enabled else "not_reached"
         diagnostic_rows: list[dict[str, object]] = []
+        attempt_diagnostic_rows: list[dict[str, object]] = []
         aborted_by_attempt_limit = False
+        attempt_start_sim_t = 0.0
+        previous_ee_pos_for_velocity: np.ndarray | None = None
+        previous_box_pos_for_velocity: np.ndarray | None = None
+        previous_velocity_sim_t: float | None = None
 
         n_steps = int(REPLAY_DURATION * sim03.FPS)
         for frame_idx in range(n_steps + 1):
@@ -739,20 +808,72 @@ def run_trial(
                         lateral_error_mm,
                         LATERAL_ERROR_SMOOTHING_FRAMES,
                     )
-                    demo_clock[0] = min(demo_clock[0] + sim03.DT, demo.poses.duration)
+                    proposed_t_demo = min(demo_clock[0] + sim03.DT, demo.poses.duration)
                     previous_progress_sum = tracker._adaptive_progress_sum
-                    adaptive_threshold_mm = (
-                        DESCENT_GATE_THRESHOLD_M * 1000.0
-                        if is_descent_phase(demo.poses, demo_clock[0])
-                        else CONTACT_POSITION_TOLERANCE_M * 1000.0
-                    )
-                    target_pose, _ = tracker.get_target_pose_adaptive(
-                        demo.poses,
-                        t_demo=demo_clock,
-                        lateral_error_mm=smoothed_lateral_error_mm,
-                        threshold_mm=adaptive_threshold_mm,
-                        tau=replay_tau,
-                    )
+                    if (
+                        contact_gate_enabled
+                        and contact_gate_mode == "preclose"
+                        and constraint_id is None
+                        and not gate_close_allowed
+                        and proposed_t_demo >= DEMO_APPROACH_DURATION
+                    ):
+                        preclose_t_demo = max(0.0, DEMO_APPROACH_DURATION - sim03.DT)
+                        demo_clock[0] = preclose_t_demo
+                        target_pose = tracker.get_target_pose(
+                            demo.poses,
+                            t_demo=preclose_t_demo,
+                            tau=replay_tau,
+                        )
+                        if not np.isfinite(gate_wait_start_sim_t):
+                            gate_wait_start_sim_t = replay_t
+                        contact_gate_wait_s = replay_t - gate_wait_start_sim_t
+                        target_pos_for_gate = np.asarray(target_pose[:3, 3], dtype=float)
+                        box_pos_for_gate = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+                        ee_to_target_at_gate_mm = float(
+                            np.linalg.norm((ee_pos_before_command - target_pos_for_gate)[:2]) * 1000.0
+                        )
+                        ee_to_object_at_gate_mm = float(
+                            np.linalg.norm((ee_pos_before_command - box_pos_for_gate)[:2]) * 1000.0
+                        )
+                        target_ok = ee_to_target_at_gate_mm <= contact_gate_ee_to_target_xy_threshold_mm
+                        object_ok = ee_to_object_at_gate_mm <= contact_gate_ee_to_object_xy_threshold_mm
+                        if target_ok and object_ok:
+                            gate_close_allowed = True
+                            contact_gate_passed = True
+                            gate_fail_reason = "none"
+                            close_allowed_sim_t = replay_t
+                            close_allowed_t_demo = proposed_t_demo
+                            demo_clock[0] = proposed_t_demo
+                            adaptive_threshold_mm = CONTACT_POSITION_TOLERANCE_M * 1000.0
+                            target_pose, _ = tracker.get_target_pose_adaptive(
+                                demo.poses,
+                                t_demo=demo_clock,
+                                lateral_error_mm=smoothed_lateral_error_mm,
+                                threshold_mm=adaptive_threshold_mm,
+                                tau=replay_tau,
+                            )
+                        elif contact_gate_wait_s >= contact_gate_max_wait_s:
+                            contact_gate_timeout = True
+                            gate_fail_reason = "ee_to_target" if not target_ok else "ee_to_object"
+                            aborted_by_attempt_limit = True
+                            break
+                        else:
+                            gate_fail_reason = "ee_to_target" if not target_ok else "ee_to_object"
+                            n_gate_freeze_frames += 1
+                    else:
+                        demo_clock[0] = proposed_t_demo
+                        adaptive_threshold_mm = (
+                            DESCENT_GATE_THRESHOLD_M * 1000.0
+                            if is_descent_phase(demo.poses, demo_clock[0])
+                            else CONTACT_POSITION_TOLERANCE_M * 1000.0
+                        )
+                        target_pose, _ = tracker.get_target_pose_adaptive(
+                            demo.poses,
+                            t_demo=demo_clock,
+                            lateral_error_mm=smoothed_lateral_error_mm,
+                            threshold_mm=adaptive_threshold_mm,
+                            tau=replay_tau,
+                        )
                     frame_progress_rate = tracker._adaptive_progress_sum - previous_progress_sum
                     if DEBUG_ADAPTIVE_GATE and frame_idx % 30 == 0:
                         print(
@@ -769,15 +890,164 @@ def run_trial(
                 t_demo = min(replay_t, demo.poses.duration)
                 target_pose = demo.poses.get_pose_at(t_demo)
 
-            gripper_width = gripper_width_from_demo(demo, t_demo)
+            if (
+                contact_gate_enabled
+                and moving_object
+                and constraint_id is None
+                and not gate_close_allowed
+                and contact_gate_mode == "legacy"
+                and t_demo >= DEMO_APPROACH_DURATION
+            ):
+                if not np.isfinite(gate_wait_start_sim_t):
+                    gate_wait_start_sim_t = replay_t
+                contact_gate_wait_s = replay_t - gate_wait_start_sim_t
+                ee_pos_for_gate = sim03.get_ee_position(panda_id)
+                target_pos_for_gate = np.asarray(target_pose[:3, 3], dtype=float)
+                box_pos_for_gate = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+                ee_to_target_at_gate_mm = float(
+                    np.linalg.norm((ee_pos_for_gate - target_pos_for_gate)[:2]) * 1000.0
+                )
+                ee_to_object_at_gate_mm = float(
+                    np.linalg.norm((ee_pos_for_gate - box_pos_for_gate)[:2]) * 1000.0
+                )
+                target_ok = ee_to_target_at_gate_mm <= contact_gate_ee_to_target_xy_threshold_mm
+                object_ok = ee_to_object_at_gate_mm <= contact_gate_ee_to_object_xy_threshold_mm
+                if target_ok and object_ok:
+                    gate_close_allowed = True
+                    contact_gate_passed = True
+                    gate_fail_reason = "none"
+                    close_allowed_sim_t = replay_t
+                    close_allowed_t_demo = t_demo
+                elif contact_gate_wait_s >= contact_gate_max_wait_s:
+                    contact_gate_timeout = True
+                    gate_fail_reason = (
+                        "ee_to_target"
+                        if not target_ok
+                        else "ee_to_object"
+                    )
+                    aborted_by_attempt_limit = True
+                    break
+                else:
+                    gate_fail_reason = (
+                        "ee_to_target"
+                        if not target_ok
+                        else "ee_to_object"
+                    )
+                    n_gate_freeze_frames += 1
+                    t_demo = max(0.0, DEMO_APPROACH_DURATION - sim03.DT)
+                    if tracker is not None:
+                        demo_clock[0] = t_demo
+                        target_pose = tracker.get_target_pose(
+                            demo.poses,
+                            t_demo=t_demo,
+                            tau=replay_tau,
+                        )
+                    else:
+                        target_pose = demo.poses.get_pose_at(t_demo)
+
+            nominal_gripper_width = gripper_width_from_demo(demo, t_demo)
+            gripper_width = OPEN_GRIPPER if contact_gate_enabled and not gate_close_allowed else nominal_gripper_width
+            if close_retime_enabled and not contact_gate_enabled and constraint_id is None:
+                close_window_start = max(0.0, DEMO_APPROACH_DURATION - retime_window_before_close_s)
+                close_window_end = DEMO_APPROACH_DURATION + retime_window_after_close_s
+                if close_retime_triggered:
+                    close_elapsed_s = max(0.0, replay_t - close_trigger_sim_t)
+                    gripper_width = gripper_width_from_demo(
+                        demo,
+                        min(DEMO_APPROACH_DURATION + close_elapsed_s, demo.poses.duration),
+                    )
+                elif close_window_start <= t_demo <= close_window_end:
+                    if close_retime_fail_reason == "not_reached":
+                        close_retime_fail_reason = "waiting"
+                    target_pos_for_retime = np.asarray(target_pose[:3, 3], dtype=float)
+                    ee_pos_for_retime = sim03.get_ee_position(panda_id)
+                    box_pos_for_retime = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+                    retime_ee_to_object_mm = float(
+                        np.linalg.norm((ee_pos_for_retime - box_pos_for_retime)[:2]) * 1000.0
+                    )
+                    retime_ee_to_target_mm = float(
+                        np.linalg.norm((ee_pos_for_retime - target_pos_for_retime)[:2]) * 1000.0
+                    )
+                    close_retime_wait_s = max(0.0, t_demo - close_window_start)
+                    object_ok = retime_ee_to_object_mm <= close_trigger_ee_to_object_threshold_mm
+                    target_ok = retime_ee_to_target_mm <= close_trigger_ee_to_target_threshold_mm
+                    if object_ok and target_ok:
+                        close_retime_triggered = True
+                        close_retime_fail_reason = "none"
+                        close_trigger_sim_t = replay_t
+                        close_trigger_t_demo = t_demo
+                        close_trigger_ee_to_object_mm = retime_ee_to_object_mm
+                        close_trigger_ee_to_target_mm = retime_ee_to_target_mm
+                        gripper_width = gripper_width_from_demo(demo, DEMO_APPROACH_DURATION)
+                    else:
+                        close_retime_fail_reason = "ee_to_object" if not object_ok else "ee_to_target"
+                        gripper_width = OPEN_GRIPPER
+                elif t_demo > close_window_end:
+                    close_retime_timeout = True
+                    close_retime_wait_s = close_window_end - close_window_start
+                    if close_retime_fail_reason in {"not_reached", "waiting"}:
+                        close_retime_fail_reason = "window_expired"
+                    gripper_width = nominal_gripper_width
             if gripper_width < OPEN_GRIPPER and not np.isfinite(gripper_close_sim_t):
                 gripper_close_sim_t = replay_t
                 gripper_close_t_demo = t_demo
             if moving_object and constraint_id is None and gripper_width < OPEN_GRIPPER:
                 ee_pos_before_close = sim03.get_ee_position(panda_id)
                 box_pos_before_close = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+                target_pos_before_close = np.asarray(target_pose[:3, 3], dtype=float)
                 close_distance = float(np.linalg.norm((ee_pos_before_close - box_pos_before_close)[:2]))
+                dt_velocity = (
+                    replay_t - previous_velocity_sim_t
+                    if previous_velocity_sim_t is not None
+                    else float("nan")
+                )
+                if (
+                    previous_ee_pos_for_velocity is not None
+                    and previous_box_pos_for_velocity is not None
+                    and np.isfinite(dt_velocity)
+                    and dt_velocity > 0.0
+                ):
+                    ee_velocity_xy_mm_s = float(
+                        np.linalg.norm((ee_pos_before_close - previous_ee_pos_for_velocity)[:2])
+                        * 1000.0
+                        / dt_velocity
+                    )
+                    object_velocity_xy_mm_s = float(
+                        np.linalg.norm((box_pos_before_close - previous_box_pos_for_velocity)[:2])
+                        * 1000.0
+                        / dt_velocity
+                    )
+                else:
+                    ee_velocity_xy_mm_s = float("nan")
+                    object_velocity_xy_mm_s = float("nan")
+                close_candidate_row = {
+                    "condition": condition_label or replay_mode,
+                    "speed_cm_s": speed_cm_s,
+                    "trial": trial_idx + 1,
+                    "seed": seed,
+                    "attempt_idx": attempts_used,
+                    "attempt_start_sim_t": attempt_start_sim_t,
+                    "close_candidate_sim_t": replay_t,
+                    "t_demo_at_close": t_demo,
+                    "gripper_width_at_close": gripper_width,
+                    "ee_to_object_xy_at_close_mm": close_distance * 1000.0,
+                    "ee_to_target_xy_at_close_mm": float(
+                        np.linalg.norm((ee_pos_before_close - target_pos_before_close)[:2]) * 1000.0
+                    ),
+                    "target_to_object_xy_at_close_mm": float(
+                        np.linalg.norm((target_pos_before_close - box_pos_before_close)[:2]) * 1000.0
+                    ),
+                    "ee_velocity_xy_at_close_mm_s": ee_velocity_xy_mm_s,
+                    "object_velocity_xy_at_close_mm_s": object_velocity_xy_mm_s,
+                    "close_distance_mm": close_distance * 1000.0,
+                    "close_rejected_reason": "pending",
+                    "attempt_success": False,
+                    "trial_success": False,
+                    "main_failure": "pending",
+                }
                 if close_distance > GRASP_CLOSE_BOX_EE_DISTANCE_M:
+                    close_candidate_row["close_rejected_reason"] = "ee_object_distance"
+                    attempt_diagnostic_rows.append(close_candidate_row)
                     if DEBUG_CONTACT_WINDOW:
                         print(
                             f"abort attempt={attempts_used} frame={frame_idx:03d} "
@@ -793,6 +1063,7 @@ def run_trial(
                     approach_errors_xy.clear()
                     lateral_error_window.clear()
                     demo_target_error_window.clear()
+                    attempt_start_sim_t = replay_t
                     if replay_mode == "static_replay":
                         target_pose = demo.poses.get_pose_at(0.0)
                     else:
@@ -809,6 +1080,9 @@ def run_trial(
                         OPEN_GRIPPER,
                     )
                     continue
+                close_candidate_row["close_rejected_reason"] = "accepted_candidate"
+            else:
+                close_candidate_row = None
 
             command_and_step(
                 panda_id,
@@ -913,6 +1187,25 @@ def run_trial(
                         "attempt_index": attempts_used,
                         "observation_delay_s": observation_delay_s,
                         "observation_time": cloud_time,
+                        "gate_state": (
+                            "disabled"
+                            if not contact_gate_enabled
+                            else ("passed" if gate_close_allowed else "waiting")
+                        ),
+                        "gate_mode": contact_gate_mode,
+                        "gate_passed": int(contact_gate_passed),
+                        "gate_timeout": int(contact_gate_timeout),
+                        "gate_fail_reason": gate_fail_reason,
+                        "close_allowed": int(gate_close_allowed),
+                        "n_gate_freeze_frames": n_gate_freeze_frames,
+                        "contact_gate_wait_s": contact_gate_wait_s,
+                        "close_retime_enabled": int(close_retime_enabled),
+                        "close_retime_triggered": int(close_retime_triggered),
+                        "close_retime_timeout": int(close_retime_timeout),
+                        "close_trigger_sim_t": close_trigger_sim_t,
+                        "close_trigger_t_demo": close_trigger_t_demo,
+                        "close_retime_wait_s": close_retime_wait_s,
+                        "close_retime_fail_reason": close_retime_fail_reason,
                     }
                 )
 
@@ -932,6 +1225,10 @@ def run_trial(
             previous_constraint_id = constraint_id
             constraint_id = maybe_attach_box(panda_id, box_id, gripper_width, constraint_id)
             if previous_constraint_id is None and constraint_id is not None:
+                if close_candidate_row is not None:
+                    close_candidate_row["attempt_success"] = True
+                    close_candidate_row["close_rejected_reason"] = "none"
+                    attempt_diagnostic_rows.append(close_candidate_row)
                 contact_position_error_mm = ee_to_target_mm
                 if tracking_errors_mm:
                     contact_tracking_error_mm = tracking_errors_mm[-1][1]
@@ -944,10 +1241,16 @@ def run_trial(
                 )
                 position_success = demo_target_error <= CONTACT_POSITION_TOLERANCE_M
                 orientation_success = orientation_error_deg <= ORIENTATION_TOLERANCE_DEG
+            elif close_candidate_row is not None:
+                close_candidate_row["close_rejected_reason"] = "attach_not_created"
+                attempt_diagnostic_rows.append(close_candidate_row)
 
             box_z = float(p.getBasePositionAndOrientation(box_id)[0][2])
             max_box_z = max(max_box_z, box_z)
             final_box_z = box_z
+            previous_ee_pos_for_velocity = ee_pos.copy()
+            previous_box_pos_for_velocity = box_pos_after_step.copy()
+            previous_velocity_sim_t = replay_t
 
             if record_gif and frame_idx % GIF_SAMPLE_STRIDE == 0:
                 gif_frames.append(capture_video_frame(video_view, video_projection))
@@ -989,6 +1292,21 @@ def run_trial(
             "attempt_index",
             "observation_delay_s",
             "observation_time",
+            "gate_state",
+            "gate_mode",
+            "gate_passed",
+            "gate_timeout",
+            "gate_fail_reason",
+            "close_allowed",
+            "n_gate_freeze_frames",
+            "contact_gate_wait_s",
+            "close_retime_enabled",
+            "close_retime_triggered",
+            "close_retime_timeout",
+            "close_trigger_sim_t",
+            "close_trigger_t_demo",
+            "close_retime_wait_s",
+            "close_retime_fail_reason",
         ]
         with diagnostics_path.open("w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -999,6 +1317,52 @@ def run_trial(
     max_lift_m = max_box_z - float(STATIC_BOX_POS[2])
     lift_success = final_lift_m > LIFT_SUCCESS_MARGIN
     success = lift_success and position_success and orientation_success and approach_success
+    main_failure_for_attempts = "none"
+    if not success:
+        if contact_gate_timeout:
+            main_failure_for_attempts = "contact_gate_timeout"
+        elif aborted_by_attempt_limit:
+            main_failure_for_attempts = "attempt_limit"
+        elif not lift_success:
+            main_failure_for_attempts = "lift"
+        elif not position_success:
+            main_failure_for_attempts = "position"
+        elif not orientation_success:
+            main_failure_for_attempts = "orientation"
+        elif not approach_success:
+            main_failure_for_attempts = "approach"
+        else:
+            main_failure_for_attempts = "unknown"
+    if attempt_diagnostics_path is not None:
+        attempt_diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "condition",
+            "speed_cm_s",
+            "trial",
+            "seed",
+            "attempt_idx",
+            "attempt_start_sim_t",
+            "close_candidate_sim_t",
+            "t_demo_at_close",
+            "gripper_width_at_close",
+            "ee_to_object_xy_at_close_mm",
+            "ee_to_target_xy_at_close_mm",
+            "target_to_object_xy_at_close_mm",
+            "ee_velocity_xy_at_close_mm_s",
+            "object_velocity_xy_at_close_mm_s",
+            "close_distance_mm",
+            "close_rejected_reason",
+            "attempt_success",
+            "trial_success",
+            "main_failure",
+        ]
+        with attempt_diagnostics_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in attempt_diagnostic_rows:
+                row["trial_success"] = success
+                row["main_failure"] = main_failure_for_attempts
+                writer.writerow(row)
     progress_rate = 1.0
     if moving_object and tracker is not None:
         progress_rate = tracker.progress_rate
@@ -1092,6 +1456,25 @@ def run_trial(
         ),
         gripper_close_sim_t=gripper_close_sim_t,
         gripper_close_t_demo=gripper_close_t_demo,
+        contact_gate_enabled=contact_gate_enabled,
+        contact_gate_passed=contact_gate_passed,
+        contact_gate_timeout=contact_gate_timeout,
+        contact_gate_wait_s=contact_gate_wait_s,
+        n_gate_freeze_frames=n_gate_freeze_frames,
+        gate_fail_reason=gate_fail_reason,
+        ee_to_target_at_gate_mm=ee_to_target_at_gate_mm,
+        ee_to_object_at_gate_mm=ee_to_object_at_gate_mm,
+        close_allowed_sim_t=close_allowed_sim_t,
+        close_allowed_t_demo=close_allowed_t_demo,
+        close_retime_enabled=close_retime_enabled,
+        close_retime_triggered=close_retime_triggered,
+        close_retime_timeout=close_retime_timeout,
+        close_trigger_sim_t=close_trigger_sim_t,
+        close_trigger_t_demo=close_trigger_t_demo,
+        close_trigger_ee_to_object_mm=close_trigger_ee_to_object_mm,
+        close_trigger_ee_to_target_mm=close_trigger_ee_to_target_mm,
+        close_retime_wait_s=close_retime_wait_s,
+        close_retime_fail_reason=close_retime_fail_reason,
     )
 
 
@@ -1099,6 +1482,8 @@ def trial_main_failure(result: TrialResult) -> str:
     """Return the primary failed success condition for one trial."""
     if result.success:
         return "none"
+    if result.contact_gate_timeout:
+        return "contact_gate_timeout"
     if result.attempt_limit_failure:
         return "attempt_limit"
     if not result.lift_success:

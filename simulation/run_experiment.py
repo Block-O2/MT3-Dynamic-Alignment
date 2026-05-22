@@ -44,6 +44,29 @@ AVAILABLE_CONDITIONS = {
         "available": True,
         "description": "Moving object, tracked object-frame replay with no prediction ahead.",
     },
+    "dynamic_tau0_contact_gated": {
+        "replay_mode": "dynamic_tau0",
+        "tau": 0.0,
+        "available": True,
+        "contact_gate_enabled": True,
+        "contact_gate_mode": "legacy",
+        "description": "dynamic_tau0 with pre-close contact-aware temporal gate.",
+    },
+    "dynamic_tau0_preclose_gated": {
+        "replay_mode": "dynamic_tau0",
+        "tau": 0.0,
+        "available": True,
+        "contact_gate_enabled": True,
+        "contact_gate_mode": "preclose",
+        "description": "dynamic_tau0 with PRE_CLOSE_ALIGN target hold before gripper closing.",
+    },
+    "dynamic_tau0_close_retimed": {
+        "replay_mode": "dynamic_tau0",
+        "tau": 0.0,
+        "available": True,
+        "close_retime_enabled": True,
+        "description": "dynamic_tau0 with event-triggered gripper close retiming inside a limited close window.",
+    },
     "dynamic_cv": {
         "replay_mode": "dynamic_cv",
         "tau": 0.1,
@@ -111,6 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--record-gif", action="store_true")
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--record-diagnostics", action="store_true")
+    parser.add_argument("--contact-gate-ee-to-target-xy-threshold-mm", type=float, default=12.0)
+    parser.add_argument("--contact-gate-ee-to-object-xy-threshold-mm", type=float, default=35.0)
+    parser.add_argument("--contact-gate-max-wait-s", type=float, default=2.0)
+    parser.add_argument("--close-trigger-ee-to-object-threshold-mm", type=float, default=40.0)
+    parser.add_argument("--close-trigger-ee-to-target-threshold-mm", type=float, default=25.0)
+    parser.add_argument("--retime-window-before-close-s", type=float, default=0.5)
+    parser.add_argument("--retime-window-after-close-s", type=float, default=1.0)
     parser.add_argument(
         "--latency-validation",
         action="store_true",
@@ -183,6 +213,19 @@ def config_from_args(args: argparse.Namespace, grasp, trial_specs: list[dict] | 
         "trials": args.trials,
         "seed": args.seed,
         "record_diagnostics": bool(args.record_diagnostics),
+        "contact_gate_defaults": {
+            "contact_gate_ee_to_target_xy_threshold_mm": args.contact_gate_ee_to_target_xy_threshold_mm,
+            "contact_gate_ee_to_object_xy_threshold_mm": args.contact_gate_ee_to_object_xy_threshold_mm,
+            "contact_gate_max_wait_s": args.contact_gate_max_wait_s,
+            "note": "Conservative initial Stage 5A smoke defaults; not tuned for success.",
+        },
+        "close_retime_defaults": {
+            "close_trigger_ee_to_object_threshold_mm": args.close_trigger_ee_to_object_threshold_mm,
+            "close_trigger_ee_to_target_threshold_mm": args.close_trigger_ee_to_target_threshold_mm,
+            "retime_window_before_close_s": args.retime_window_before_close_s,
+            "retime_window_after_close_s": args.retime_window_after_close_s,
+            "note": "Stage 5C smoke defaults from offline feasibility; not final tuned values.",
+        },
         "latency_validation": bool(args.latency_validation),
         "observation_delay_ms": args.observation_delay_ms,
         "tau_values_s": args.tau_values,
@@ -246,6 +289,25 @@ RAW_FIELDS = [
     "contact_window_target_to_object_xy_mm",
     "gripper_close_sim_t",
     "gripper_close_t_demo",
+    "contact_gate_enabled",
+    "contact_gate_passed",
+    "contact_gate_timeout",
+    "contact_gate_wait_s",
+    "n_gate_freeze_frames",
+    "gate_fail_reason",
+    "ee_to_target_at_gate_mm",
+    "ee_to_object_at_gate_mm",
+    "close_allowed_sim_t",
+    "close_allowed_t_demo",
+    "close_retime_enabled",
+    "close_retime_triggered",
+    "close_retime_timeout",
+    "close_trigger_sim_t",
+    "close_trigger_t_demo",
+    "close_trigger_ee_to_object_mm",
+    "close_trigger_ee_to_target_mm",
+    "close_retime_wait_s",
+    "close_retime_fail_reason",
     "contact_position_error_mm",
     "orientation_error_deg",
     "approach_error_mm",
@@ -300,6 +362,16 @@ def append_raw_row(path: Path, row: dict) -> None:
         "contact_window_target_to_object_xy_mm",
         "gripper_close_sim_t",
         "gripper_close_t_demo",
+        "contact_gate_wait_s",
+        "ee_to_target_at_gate_mm",
+        "ee_to_object_at_gate_mm",
+        "close_allowed_sim_t",
+        "close_allowed_t_demo",
+        "close_trigger_sim_t",
+        "close_trigger_t_demo",
+        "close_trigger_ee_to_object_mm",
+        "close_trigger_ee_to_target_mm",
+        "close_retime_wait_s",
         "contact_position_error_mm",
         "orientation_error_deg",
         "approach_error_mm",
@@ -308,6 +380,12 @@ def append_raw_row(path: Path, row: dict) -> None:
     ]:
         serialized[key] = csv_float(serialized[key])
     serialized["success"] = int(serialized["success"])
+    serialized["contact_gate_enabled"] = int(bool(serialized["contact_gate_enabled"]))
+    serialized["contact_gate_passed"] = int(bool(serialized["contact_gate_passed"]))
+    serialized["contact_gate_timeout"] = int(bool(serialized["contact_gate_timeout"]))
+    serialized["close_retime_enabled"] = int(bool(serialized["close_retime_enabled"]))
+    serialized["close_retime_triggered"] = int(bool(serialized["close_retime_triggered"]))
+    serialized["close_retime_timeout"] = int(bool(serialized["close_retime_timeout"]))
     with path.open("a", newline="", encoding="utf-8") as file:
         csv.DictWriter(file, fieldnames=RAW_FIELDS).writerow(serialized)
 
@@ -332,9 +410,18 @@ def write_summary(path: Path, rows: list[dict]) -> None:
         "n_failures",
         "n_no_contact",
         "n_finite_contact_error",
+        "n_gate_timeout",
+        "n_close_retime_timeout",
         "success_rate",
+        "contact_gate_pass_rate",
+        "close_retime_trigger_rate",
         "mean_lift_mm",
         "mean_progress_pct",
+        "mean_contact_gate_wait_s",
+        "mean_n_gate_freeze_frames",
+        "mean_close_retime_wait_s",
+        "mean_close_trigger_ee_to_object_finite_only",
+        "mean_close_trigger_ee_to_target_finite_only",
         "mean_contact_position_error_finite_only",
         "mean_ee_to_target_error_contact_window_finite_only",
         "mean_contact_window_ee_to_object_xy_finite_only",
@@ -374,6 +461,8 @@ def write_summary(path: Path, rows: list[dict]) -> None:
             n_finite_contact_error = int(
                 sum(np.isfinite(row["contact_position_error_mm"]) for row in group)
             )
+            gated_rows = [row for row in group if row.get("contact_gate_enabled", False)]
+            retimed_rows = [row for row in group if row.get("close_retime_enabled", False)]
             writer.writerow(
                 {
                     "condition": condition,
@@ -386,9 +475,18 @@ def write_summary(path: Path, rows: list[dict]) -> None:
                     "n_failures": len(group) - n_success,
                     "n_no_contact": n_no_contact,
                     "n_finite_contact_error": n_finite_contact_error,
+                    "n_gate_timeout": int(sum(row.get("contact_gate_timeout", False) for row in group)),
+                    "n_close_retime_timeout": int(sum(row.get("close_retime_timeout", False) for row in group)),
                     "success_rate": f"{np.mean([row['success'] for row in group]):.3f}",
+                    "contact_gate_pass_rate": f"{np.mean([row.get('contact_gate_passed', False) for row in gated_rows]):.3f}" if gated_rows else "nan",
+                    "close_retime_trigger_rate": f"{np.mean([row.get('close_retime_triggered', False) for row in retimed_rows]):.3f}" if retimed_rows else "nan",
                     "mean_lift_mm": f"{np.mean([row['lift_mm'] for row in group]):.3f}",
                     "mean_progress_pct": f"{np.mean([row['progress_pct'] for row in group]):.3f}",
+                    "mean_contact_gate_wait_s": f"{finite_mean(row.get('contact_gate_wait_s', float('nan')) for row in gated_rows):.3f}" if gated_rows else "nan",
+                    "mean_n_gate_freeze_frames": f"{finite_mean(float(row.get('n_gate_freeze_frames', 0)) for row in gated_rows):.3f}" if gated_rows else "nan",
+                    "mean_close_retime_wait_s": f"{finite_mean(row.get('close_retime_wait_s', float('nan')) for row in retimed_rows):.3f}" if retimed_rows else "nan",
+                    "mean_close_trigger_ee_to_object_finite_only": f"{finite_mean(row.get('close_trigger_ee_to_object_mm', float('nan')) for row in retimed_rows):.3f}" if retimed_rows else "nan",
+                    "mean_close_trigger_ee_to_target_finite_only": f"{finite_mean(row.get('close_trigger_ee_to_target_mm', float('nan')) for row in retimed_rows):.3f}" if retimed_rows else "nan",
                     "mean_contact_position_error_finite_only": f"{finite_mean(row['contact_position_error_mm'] for row in group):.3f}",
                     "mean_ee_to_target_error_contact_window_finite_only": f"{finite_mean(row['mean_ee_to_target_error_contact_window_mm'] for row in group):.3f}",
                     "mean_contact_window_ee_to_object_xy_finite_only": f"{finite_mean(row['contact_window_ee_to_object_xy_mm'] for row in group):.3f}",
@@ -428,6 +526,7 @@ def build_trial_specs(args: argparse.Namespace) -> tuple[list[dict], list[str]]:
                         "replay_mode": "dynamic_cv",
                         "tau": float(tau_s),
                         "observation_delay_ms": float(delay_ms),
+                        "contact_gate_enabled": False,
                         "available": True,
                         "description": "CV dynamic replay with artificial delayed object point-cloud observations.",
                     }
@@ -447,6 +546,9 @@ def build_trial_specs(args: argparse.Namespace) -> tuple[list[dict], list[str]]:
                 "replay_mode": info["replay_mode"],
                 "tau": info["tau"],
                 "observation_delay_ms": 0.0,
+                "contact_gate_enabled": bool(info.get("contact_gate_enabled", False)),
+                "contact_gate_mode": info.get("contact_gate_mode", "legacy"),
+                "close_retime_enabled": bool(info.get("close_retime_enabled", False)),
                 "available": True,
                 "description": info["description"],
             }
@@ -529,6 +631,10 @@ def write_analysis(path: Path, args: argparse.Namespace, rows: list[dict], defer
         lines.extend(formal_baseline_answers(rows))
     if args.latency_validation or "latency" in args.stage_name:
         lines.extend(latency_validation_answers(rows))
+    if "stage5a" in args.stage_name or "contact_gated" in args.stage_name:
+        lines.extend(contact_gating_answers(rows))
+    if "stage5c" in args.stage_name or "close_retimed" in args.stage_name:
+        lines.extend(close_retiming_answers(rows))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -717,6 +823,135 @@ def latency_validation_answers(rows: list[dict]) -> list[str]:
         recommendation,
     ]
     return lines
+
+
+def contact_gating_answers(rows: list[dict]) -> list[str]:
+    by_condition: dict[str, list[dict]] = {}
+    by_condition_speed: dict[tuple[str, float], list[dict]] = {}
+    for row in rows:
+        by_condition.setdefault(row["condition"], []).append(row)
+        by_condition_speed.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
+
+    def count_failure(group: list[dict], label: str) -> int:
+        return sum(row["main_failure"] == label for row in group)
+
+    def no_contact(group: list[dict]) -> int:
+        return sum(not np.isfinite(row["contact_position_error_mm"]) for row in group)
+
+    base = by_condition.get("dynamic_tau0", [])
+    gated = by_condition.get("dynamic_tau0_contact_gated", [])
+    preclose = by_condition.get("dynamic_tau0_preclose_gated", [])
+    evaluated = preclose or gated
+    base_attempt = count_failure(base, "attempt_limit")
+    gated_attempt = count_failure(evaluated, "attempt_limit")
+    gated_timeout = count_failure(evaluated, "contact_gate_timeout")
+    base_no_contact = no_contact(base)
+    gated_no_contact = no_contact(evaluated)
+    gated_success_rate = float(np.mean([row["success"] for row in evaluated])) if evaluated else float("nan")
+    base_success_rate = float(np.mean([row["success"] for row in base])) if base else float("nan")
+    gate_wait = finite_mean(row["contact_gate_wait_s"] for row in evaluated)
+    gate_pass_rate = float(np.mean([row["contact_gate_passed"] for row in evaluated])) if evaluated else float("nan")
+
+    eval_condition = "dynamic_tau0_preclose_gated" if preclose else "dynamic_tau0_contact_gated"
+    low_speed = by_condition_speed.get((eval_condition, 2.0), [])
+    high_speed = by_condition_speed.get((eval_condition, 8.0), [])
+    mid_speed_base = by_condition_speed.get(("dynamic_tau0", 4.0), [])
+    mid_speed_gated = by_condition_speed.get((eval_condition, 4.0), [])
+
+    if preclose and gated_success_rate >= base_success_rate and gated_no_contact <= base_no_contact:
+        recommendation = "PROCEED_TO_PRECLOSE_GATED_FORMAL"
+    elif evaluated and gated_timeout > 0:
+        recommendation = "FIX_PRECLOSE_GATE_LOGIC_FIRST" if preclose else "FIX_GATE_LOGIC_FIRST"
+    elif preclose:
+        recommendation = "CONTACT_GATING_NOT_PROMISING"
+    else:
+        recommendation = "CONTACT_GATING_NOT_PROMISING"
+
+    return [
+        "",
+        "## Stage 5A Contact-Aware Temporal Gating Questions",
+        "",
+        f"1. Does contact gating reduce attempt_limit / no-contact? dynamic_tau0 attempt_limit={base_attempt}, no_contact={base_no_contact}; contact_gated attempt_limit={gated_attempt}, gate_timeout={gated_timeout}, no_contact={gated_no_contact}.",
+        f"2. Does contact gating increase waiting time too much? mean_contact_gate_wait_s={gate_wait:.3f}, contact_gate_pass_rate={gate_pass_rate:.3f}.",
+        f"3. Does contact gating improve low-speed 2 cm/s and high-speed 8 cm/s cases? gated 2 cm/s success_rate={np.mean([row['success'] for row in low_speed]) if low_speed else float('nan'):.3f}; gated 8 cm/s success_rate={np.mean([row['success'] for row in high_speed]) if high_speed else float('nan'):.3f}.",
+        f"4. Does it hurt the already-strong 4 cm/s case? base 4 cm/s success_rate={np.mean([row['success'] for row in mid_speed_base]) if mid_speed_base else float('nan'):.3f}; gated 4 cm/s success_rate={np.mean([row['success'] for row in mid_speed_gated]) if mid_speed_gated else float('nan'):.3f}.",
+        "5. Are failures now more interpretable? Yes if gate_timeout/gate_fail_reason separates pre-close alignment failures from post-close attempt_limit failures; inspect raw_results.csv fields for gate_fail_reason and gate wait.",
+        "6. Is this method promising enough for a 10-trial formal comparison? Use the final recommendation below; this smoke has only two trials per condition-speed.",
+        "",
+        recommendation,
+    ]
+
+
+def close_retiming_answers(rows: list[dict]) -> list[str]:
+    by_condition: dict[str, list[dict]] = {}
+    by_condition_speed: dict[tuple[str, float], list[dict]] = {}
+    for row in rows:
+        by_condition.setdefault(row["condition"], []).append(row)
+        by_condition_speed.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
+
+    def count_failure(group: list[dict], label: str) -> int:
+        return sum(row["main_failure"] == label for row in group)
+
+    def no_contact(group: list[dict]) -> int:
+        return sum(not np.isfinite(row["contact_position_error_mm"]) for row in group)
+
+    def success_rate(group: list[dict]) -> float:
+        return float(np.mean([row["success"] for row in group])) if group else float("nan")
+
+    base = by_condition.get("dynamic_tau0", [])
+    retimed = by_condition.get("dynamic_tau0_close_retimed", [])
+    base_4 = by_condition_speed.get(("dynamic_tau0", 4.0), [])
+    retimed_4 = by_condition_speed.get(("dynamic_tau0_close_retimed", 4.0), [])
+    base_6 = by_condition_speed.get(("dynamic_tau0", 6.0), [])
+    retimed_6 = by_condition_speed.get(("dynamic_tau0_close_retimed", 6.0), [])
+    base_8 = by_condition_speed.get(("dynamic_tau0", 8.0), [])
+    retimed_8 = by_condition_speed.get(("dynamic_tau0_close_retimed", 8.0), [])
+
+    base_attempt = count_failure(base, "attempt_limit")
+    retimed_attempt = count_failure(retimed, "attempt_limit")
+    base_no_contact = no_contact(base)
+    retimed_no_contact = no_contact(retimed)
+    retime_trigger_rate = (
+        float(np.mean([row.get("close_retime_triggered", False) for row in retimed]))
+        if retimed
+        else float("nan")
+    )
+    trigger_object = finite_mean(row.get("close_trigger_ee_to_object_mm", float("nan")) for row in retimed)
+    trigger_target = finite_mean(row.get("close_trigger_ee_to_target_mm", float("nan")) for row in retimed)
+    retimed_new_failures = {
+        label: count_failure(retimed, label)
+        for label in ("approach", "orientation", "position", "lift")
+    }
+
+    preserves_4 = bool(base_4 and retimed_4) and success_rate(retimed_4) >= success_rate(base_4)
+    improves_high = (
+        (retimed_6 and base_6 and success_rate(retimed_6) > success_rate(base_6))
+        or (retimed_8 and base_8 and success_rate(retimed_8) > success_rate(base_8))
+    )
+    if preserves_4 and improves_high and retimed_attempt <= base_attempt and retimed_no_contact <= base_no_contact:
+        recommendation = "PROCEED_TO_CLOSE_RETIMED_FORMAL"
+    elif retimed and retime_trigger_rate == 0.0:
+        recommendation = "FIX_CLOSE_RETIMING_LOGIC_FIRST"
+    else:
+        recommendation = "CLOSE_RETIMING_NOT_PROMISING"
+
+    return [
+        "",
+        "## Close-Retiming Feasibility",
+        "",
+        "Offline Stage 5B diagnostics found plausible close opportunities in all failed 6/8 cm/s trials under the diagnostic criterion ee_to_object_xy_mm <= 40 mm and finite/small EE-to-target error. Most failed 8 cm/s best opportunities occurred before the original close start, suggesting close-phase timing rather than pre-close freezing.",
+        "",
+        "## Stage 5C Close-Retiming Questions",
+        "",
+        f"1. Does close_retimed preserve the strong 4 cm/s baseline? dynamic_tau0={success_rate(base_4):.3f}, close_retimed={success_rate(retimed_4):.3f}.",
+        f"2. Does close_retimed improve 6 cm/s or 8 cm/s attempt_limit/no-contact failures? 6 cm/s dynamic_tau0={success_rate(base_6):.3f}, close_retimed={success_rate(retimed_6):.3f}; 8 cm/s dynamic_tau0={success_rate(base_8):.3f}, close_retimed={success_rate(retimed_8):.3f}. Overall attempt_limit dynamic_tau0={base_attempt}, close_retimed={retimed_attempt}; no_contact dynamic_tau0={base_no_contact}, close_retimed={retimed_no_contact}.",
+        f"3. Does it simply delay closing without improving success? close_retime_trigger_rate={retime_trigger_rate:.3f}; compare success and failure counts above.",
+        f"4. Are close triggers occurring at plausible EE-object distances? mean close_trigger_ee_to_object_mm={trigger_object:.3f}, mean close_trigger_ee_to_target_mm={trigger_target:.3f}.",
+        f"5. Does retiming create new approach/orientation failures? Retimed non-attempt failure counts: {retimed_new_failures}.",
+        f"6. Is it promising enough for a 10-trial formal comparison? Recommendation: {recommendation}.",
+        "",
+        recommendation,
+    ]
 
 
 def write_baseline_audit(path: Path) -> None:
@@ -1009,6 +1244,12 @@ def log_condition_verification(conditions: list[str]) -> None:
             print("  static_replay: no tracker.update, no get_target_pose, no dynamic compensation, tau=nan, model=none, adaptive_replay=false")
         elif condition == "dynamic_tau0":
             print("  dynamic_tau0: tracker.update=true, get_target_pose=true, tau=0.0, model=CVModel, adaptive_replay=true")
+        elif condition == "dynamic_tau0_contact_gated":
+            print("  dynamic_tau0_contact_gated: dynamic_tau0 plus pre-close contact gate, tau=0.0, model=CVModel, adaptive_replay=true")
+        elif condition == "dynamic_tau0_preclose_gated":
+            print("  dynamic_tau0_preclose_gated: dynamic_tau0 plus PRE_CLOSE_ALIGN gate, tau=0.0, model=CVModel, adaptive_replay=true")
+        elif condition == "dynamic_tau0_close_retimed":
+            print("  dynamic_tau0_close_retimed: dynamic_tau0 plus close-phase gripper retiming, tau=0.0, model=CVModel, adaptive_replay=true")
         elif condition == "dynamic_cv":
             print("  dynamic_cv: tracker.update=true, get_target_pose=true, tau=0.1, model=CVModel, adaptive_replay=true")
         elif condition == "dynamic_ct":
@@ -1041,6 +1282,14 @@ def run_one_trial(
     seed: int,
     record_gif: bool,
     diagnostics_dir: Path | None,
+    attempt_diagnostics_dir: Path | None,
+    contact_gate_ee_to_target_xy_threshold_mm: float,
+    contact_gate_ee_to_object_xy_threshold_mm: float,
+    contact_gate_max_wait_s: float,
+    close_trigger_ee_to_object_threshold_mm: float,
+    close_trigger_ee_to_target_threshold_mm: float,
+    retime_window_before_close_s: float,
+    retime_window_after_close_s: float,
 ) -> dict:
     condition = trial_spec["condition"]
     if not trial_spec["available"]:
@@ -1054,6 +1303,12 @@ def run_one_trial(
             diagnostics_dir
             / f"{condition}_speed{float(speed):.1f}_trial{trial_idx + 1}.csv"
         )
+    attempt_diagnostics_path = None
+    if attempt_diagnostics_dir is not None:
+        attempt_diagnostics_path = (
+            attempt_diagnostics_dir
+            / f"{condition}_speed{float(speed):.1f}_trial{trial_idx + 1}.csv"
+        )
     tau_value = trial_spec["tau"]
     tau_for_row = float(tau_value) if tau_value is not None else float("nan")
     observation_delay_ms = float(trial_spec.get("observation_delay_ms", 0.0))
@@ -1065,7 +1320,18 @@ def run_one_trial(
         replay_mode=trial_spec["replay_mode"],
         replay_tau=tau_value,
         observation_delay_s=observation_delay_ms / 1000.0,
+        contact_gate_enabled=bool(trial_spec.get("contact_gate_enabled", False)),
+        contact_gate_mode=str(trial_spec.get("contact_gate_mode", "legacy")),
+        contact_gate_ee_to_target_xy_threshold_mm=contact_gate_ee_to_target_xy_threshold_mm,
+        contact_gate_ee_to_object_xy_threshold_mm=contact_gate_ee_to_object_xy_threshold_mm,
+        contact_gate_max_wait_s=contact_gate_max_wait_s,
+        close_retime_enabled=bool(trial_spec.get("close_retime_enabled", False)),
+        close_trigger_ee_to_object_threshold_mm=close_trigger_ee_to_object_threshold_mm,
+        close_trigger_ee_to_target_threshold_mm=close_trigger_ee_to_target_threshold_mm,
+        retime_window_before_close_s=retime_window_before_close_s,
+        retime_window_after_close_s=retime_window_after_close_s,
         diagnostics_path=diagnostics_path,
+        attempt_diagnostics_path=attempt_diagnostics_path,
         condition_label=condition,
         seed=seed,
     )
@@ -1101,6 +1367,25 @@ def run_one_trial(
         "contact_window_target_to_object_xy_mm": float(result.contact_window_target_to_object_xy_mm),
         "gripper_close_sim_t": float(result.gripper_close_sim_t),
         "gripper_close_t_demo": float(result.gripper_close_t_demo),
+        "contact_gate_enabled": bool(result.contact_gate_enabled),
+        "contact_gate_passed": bool(result.contact_gate_passed),
+        "contact_gate_timeout": bool(result.contact_gate_timeout),
+        "contact_gate_wait_s": float(result.contact_gate_wait_s),
+        "n_gate_freeze_frames": int(result.n_gate_freeze_frames),
+        "gate_fail_reason": result.gate_fail_reason,
+        "ee_to_target_at_gate_mm": float(result.ee_to_target_at_gate_mm),
+        "ee_to_object_at_gate_mm": float(result.ee_to_object_at_gate_mm),
+        "close_allowed_sim_t": float(result.close_allowed_sim_t),
+        "close_allowed_t_demo": float(result.close_allowed_t_demo),
+        "close_retime_enabled": bool(result.close_retime_enabled),
+        "close_retime_triggered": bool(result.close_retime_triggered),
+        "close_retime_timeout": bool(result.close_retime_timeout),
+        "close_trigger_sim_t": float(result.close_trigger_sim_t),
+        "close_trigger_t_demo": float(result.close_trigger_t_demo),
+        "close_trigger_ee_to_object_mm": float(result.close_trigger_ee_to_object_mm),
+        "close_trigger_ee_to_target_mm": float(result.close_trigger_ee_to_target_mm),
+        "close_retime_wait_s": float(result.close_retime_wait_s),
+        "close_retime_fail_reason": result.close_retime_fail_reason,
         "contact_position_error_mm": float(result.contact_position_error_mm),
         "orientation_error_deg": float(result.orientation_error_deg),
         "approach_error_mm": float(result.approach_max_error_mm),
@@ -1109,6 +1394,39 @@ def run_one_trial(
         "n_attempts": int(result.n_attempts),
         "runtime_s": float(runtime_s),
     }
+
+
+def combine_attempt_diagnostics(attempt_diagnostics_dir: Path, output_path: Path) -> None:
+    files = sorted(attempt_diagnostics_dir.glob("*.csv"))
+    fieldnames = [
+        "condition",
+        "speed_cm_s",
+        "trial",
+        "seed",
+        "attempt_idx",
+        "attempt_start_sim_t",
+        "close_candidate_sim_t",
+        "t_demo_at_close",
+        "gripper_width_at_close",
+        "ee_to_object_xy_at_close_mm",
+        "ee_to_target_xy_at_close_mm",
+        "target_to_object_xy_at_close_mm",
+        "ee_velocity_xy_at_close_mm_s",
+        "object_velocity_xy_at_close_mm_s",
+        "close_distance_mm",
+        "close_rejected_reason",
+        "attempt_success",
+        "trial_success",
+        "main_failure",
+    ]
+    with output_path.open("w", newline="", encoding="utf-8") as out_file:
+        writer = csv.DictWriter(out_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for path in files:
+            with path.open(newline="", encoding="utf-8") as in_file:
+                reader = csv.DictReader(in_file)
+                for row in reader:
+                    writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
 def main() -> int:
@@ -1125,6 +1443,7 @@ def main() -> int:
     summary_path = out_dir / "summary.csv"
     log_path = out_dir / "run_log.txt"
     diagnostics_dir = out_dir / "diagnostics" if args.record_diagnostics else None
+    attempt_diagnostics_dir = out_dir / "attempt_diagnostics_by_trial" if args.record_diagnostics else None
     write_command(out_dir / "command.txt")
     write_git_info(out_dir / "git_info.txt")
     write_raw_header(raw_path)
@@ -1176,6 +1495,14 @@ def main() -> int:
                                 seed=args.seed,
                                 record_gif=bool(args.record_gif),
                                 diagnostics_dir=diagnostics_dir,
+                                attempt_diagnostics_dir=attempt_diagnostics_dir,
+                                contact_gate_ee_to_target_xy_threshold_mm=args.contact_gate_ee_to_target_xy_threshold_mm,
+                                contact_gate_ee_to_object_xy_threshold_mm=args.contact_gate_ee_to_object_xy_threshold_mm,
+                                contact_gate_max_wait_s=args.contact_gate_max_wait_s,
+                                close_trigger_ee_to_object_threshold_mm=args.close_trigger_ee_to_object_threshold_mm,
+                                close_trigger_ee_to_target_threshold_mm=args.close_trigger_ee_to_target_threshold_mm,
+                                retime_window_before_close_s=args.retime_window_before_close_s,
+                                retime_window_after_close_s=args.retime_window_after_close_s,
                             )
                             rows.append(row)
                             append_raw_row(raw_path, row)
@@ -1200,6 +1527,8 @@ def main() -> int:
                 print(f"runtime_s={time.perf_counter() - start:.3f}")
 
     runtime_s = time.perf_counter() - start
+    if attempt_diagnostics_dir is not None:
+        combine_attempt_diagnostics(attempt_diagnostics_dir, out_dir / "attempt_diagnostics.csv")
     write_summary(summary_path, rows)
     write_analysis(out_dir / "analysis.md", args, rows, deferred, runtime_s, succeeded)
     write_result_self_review(out_dir / "result_self_review.md", rows, runtime_s, args.trials)
