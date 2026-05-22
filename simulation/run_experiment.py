@@ -67,6 +67,13 @@ AVAILABLE_CONDITIONS = {
         "close_retime_enabled": True,
         "description": "dynamic_tau0 with event-triggered gripper close retiming inside a limited close window.",
     },
+    "dynamic_phase_servo": {
+        "replay_mode": "dynamic_tau0",
+        "tau": 0.0,
+        "available": True,
+        "phase_servo_enabled": True,
+        "description": "Experimental object-relative phase-aware servo controller built on dynamic_tau0 tracking.",
+    },
     "dynamic_cv": {
         "replay_mode": "dynamic_cv",
         "tau": 0.1,
@@ -141,6 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--close-trigger-ee-to-target-threshold-mm", type=float, default=25.0)
     parser.add_argument("--retime-window-before-close-s", type=float, default=0.5)
     parser.add_argument("--retime-window-after-close-s", type=float, default=1.0)
+    parser.add_argument("--approach-ee-to-target-threshold-mm", type=float, default=30.0)
+    parser.add_argument("--pregrasp-ee-to-target-threshold-mm", type=float, default=20.0)
+    parser.add_argument("--phase-close-ee-to-object-threshold-mm", type=float, default=40.0)
+    parser.add_argument("--phase-close-ee-to-target-threshold-mm", type=float, default=25.0)
+    parser.add_argument("--approach-timeout-s", type=float, default=4.0)
+    parser.add_argument("--pregrasp-timeout-s", type=float, default=3.0)
+    parser.add_argument("--close-timeout-s", type=float, default=1.5)
+    parser.add_argument("--verify-attach-timeout-s", type=float, default=1.0)
     parser.add_argument(
         "--latency-validation",
         action="store_true",
@@ -226,6 +241,17 @@ def config_from_args(args: argparse.Namespace, grasp, trial_specs: list[dict] | 
             "retime_window_after_close_s": args.retime_window_after_close_s,
             "note": "Stage 5C smoke defaults from offline feasibility; not final tuned values.",
         },
+        "phase_servo_defaults": {
+            "approach_ee_to_target_threshold_mm": args.approach_ee_to_target_threshold_mm,
+            "pregrasp_ee_to_target_threshold_mm": args.pregrasp_ee_to_target_threshold_mm,
+            "close_ee_to_object_threshold_mm": args.phase_close_ee_to_object_threshold_mm,
+            "close_ee_to_target_threshold_mm": args.phase_close_ee_to_target_threshold_mm,
+            "approach_timeout_s": args.approach_timeout_s,
+            "pregrasp_timeout_s": args.pregrasp_timeout_s,
+            "close_timeout_s": args.close_timeout_s,
+            "verify_attach_timeout_s": args.verify_attach_timeout_s,
+            "note": "Stage 6A conservative smoke defaults; not tuned for success.",
+        },
         "latency_validation": bool(args.latency_validation),
         "observation_delay_ms": args.observation_delay_ms,
         "tau_values_s": args.tau_values,
@@ -308,6 +334,21 @@ RAW_FIELDS = [
     "close_trigger_ee_to_target_mm",
     "close_retime_wait_s",
     "close_retime_fail_reason",
+    "phase_controller_enabled",
+    "final_phase",
+    "phase_failure_reason",
+    "approach_duration_s",
+    "pregrasp_duration_s",
+    "close_duration_s",
+    "verify_attach_duration_s",
+    "lift_duration_s",
+    "n_phase_transitions",
+    "close_triggered",
+    "phase_close_trigger_sim_t",
+    "phase_close_trigger_ee_to_target_mm",
+    "phase_close_trigger_ee_to_object_mm",
+    "attach_verified",
+    "phase_timeout",
     "contact_position_error_mm",
     "orientation_error_deg",
     "approach_error_mm",
@@ -372,6 +413,14 @@ def append_raw_row(path: Path, row: dict) -> None:
         "close_trigger_ee_to_object_mm",
         "close_trigger_ee_to_target_mm",
         "close_retime_wait_s",
+        "approach_duration_s",
+        "pregrasp_duration_s",
+        "close_duration_s",
+        "verify_attach_duration_s",
+        "lift_duration_s",
+        "phase_close_trigger_sim_t",
+        "phase_close_trigger_ee_to_target_mm",
+        "phase_close_trigger_ee_to_object_mm",
         "contact_position_error_mm",
         "orientation_error_deg",
         "approach_error_mm",
@@ -386,6 +435,10 @@ def append_raw_row(path: Path, row: dict) -> None:
     serialized["close_retime_enabled"] = int(bool(serialized["close_retime_enabled"]))
     serialized["close_retime_triggered"] = int(bool(serialized["close_retime_triggered"]))
     serialized["close_retime_timeout"] = int(bool(serialized["close_retime_timeout"]))
+    serialized["phase_controller_enabled"] = int(bool(serialized["phase_controller_enabled"]))
+    serialized["close_triggered"] = int(bool(serialized["close_triggered"]))
+    serialized["attach_verified"] = int(bool(serialized["attach_verified"]))
+    serialized["phase_timeout"] = int(bool(serialized["phase_timeout"]))
     with path.open("a", newline="", encoding="utf-8") as file:
         csv.DictWriter(file, fieldnames=RAW_FIELDS).writerow(serialized)
 
@@ -412,9 +465,12 @@ def write_summary(path: Path, rows: list[dict]) -> None:
         "n_finite_contact_error",
         "n_gate_timeout",
         "n_close_retime_timeout",
+        "n_phase_timeout",
         "success_rate",
         "contact_gate_pass_rate",
         "close_retime_trigger_rate",
+        "phase_close_trigger_rate",
+        "attach_verified_rate",
         "mean_lift_mm",
         "mean_progress_pct",
         "mean_contact_gate_wait_s",
@@ -422,6 +478,8 @@ def write_summary(path: Path, rows: list[dict]) -> None:
         "mean_close_retime_wait_s",
         "mean_close_trigger_ee_to_object_finite_only",
         "mean_close_trigger_ee_to_target_finite_only",
+        "mean_phase_close_trigger_ee_to_object_finite_only",
+        "mean_phase_close_trigger_ee_to_target_finite_only",
         "mean_contact_position_error_finite_only",
         "mean_ee_to_target_error_contact_window_finite_only",
         "mean_contact_window_ee_to_object_xy_finite_only",
@@ -463,6 +521,7 @@ def write_summary(path: Path, rows: list[dict]) -> None:
             )
             gated_rows = [row for row in group if row.get("contact_gate_enabled", False)]
             retimed_rows = [row for row in group if row.get("close_retime_enabled", False)]
+            phase_rows = [row for row in group if row.get("phase_controller_enabled", False)]
             writer.writerow(
                 {
                     "condition": condition,
@@ -477,9 +536,12 @@ def write_summary(path: Path, rows: list[dict]) -> None:
                     "n_finite_contact_error": n_finite_contact_error,
                     "n_gate_timeout": int(sum(row.get("contact_gate_timeout", False) for row in group)),
                     "n_close_retime_timeout": int(sum(row.get("close_retime_timeout", False) for row in group)),
+                    "n_phase_timeout": int(sum(row.get("phase_timeout", False) for row in group)),
                     "success_rate": f"{np.mean([row['success'] for row in group]):.3f}",
                     "contact_gate_pass_rate": f"{np.mean([row.get('contact_gate_passed', False) for row in gated_rows]):.3f}" if gated_rows else "nan",
                     "close_retime_trigger_rate": f"{np.mean([row.get('close_retime_triggered', False) for row in retimed_rows]):.3f}" if retimed_rows else "nan",
+                    "phase_close_trigger_rate": f"{np.mean([row.get('close_triggered', False) for row in phase_rows]):.3f}" if phase_rows else "nan",
+                    "attach_verified_rate": f"{np.mean([row.get('attach_verified', False) for row in phase_rows]):.3f}" if phase_rows else "nan",
                     "mean_lift_mm": f"{np.mean([row['lift_mm'] for row in group]):.3f}",
                     "mean_progress_pct": f"{np.mean([row['progress_pct'] for row in group]):.3f}",
                     "mean_contact_gate_wait_s": f"{finite_mean(row.get('contact_gate_wait_s', float('nan')) for row in gated_rows):.3f}" if gated_rows else "nan",
@@ -487,6 +549,8 @@ def write_summary(path: Path, rows: list[dict]) -> None:
                     "mean_close_retime_wait_s": f"{finite_mean(row.get('close_retime_wait_s', float('nan')) for row in retimed_rows):.3f}" if retimed_rows else "nan",
                     "mean_close_trigger_ee_to_object_finite_only": f"{finite_mean(row.get('close_trigger_ee_to_object_mm', float('nan')) for row in retimed_rows):.3f}" if retimed_rows else "nan",
                     "mean_close_trigger_ee_to_target_finite_only": f"{finite_mean(row.get('close_trigger_ee_to_target_mm', float('nan')) for row in retimed_rows):.3f}" if retimed_rows else "nan",
+                    "mean_phase_close_trigger_ee_to_object_finite_only": f"{finite_mean(row.get('phase_close_trigger_ee_to_object_mm', float('nan')) for row in phase_rows):.3f}" if phase_rows else "nan",
+                    "mean_phase_close_trigger_ee_to_target_finite_only": f"{finite_mean(row.get('phase_close_trigger_ee_to_target_mm', float('nan')) for row in phase_rows):.3f}" if phase_rows else "nan",
                     "mean_contact_position_error_finite_only": f"{finite_mean(row['contact_position_error_mm'] for row in group):.3f}",
                     "mean_ee_to_target_error_contact_window_finite_only": f"{finite_mean(row['mean_ee_to_target_error_contact_window_mm'] for row in group):.3f}",
                     "mean_contact_window_ee_to_object_xy_finite_only": f"{finite_mean(row['contact_window_ee_to_object_xy_mm'] for row in group):.3f}",
@@ -549,6 +613,7 @@ def build_trial_specs(args: argparse.Namespace) -> tuple[list[dict], list[str]]:
                 "contact_gate_enabled": bool(info.get("contact_gate_enabled", False)),
                 "contact_gate_mode": info.get("contact_gate_mode", "legacy"),
                 "close_retime_enabled": bool(info.get("close_retime_enabled", False)),
+                "phase_servo_enabled": bool(info.get("phase_servo_enabled", False)),
                 "available": True,
                 "description": info["description"],
             }
@@ -635,6 +700,8 @@ def write_analysis(path: Path, args: argparse.Namespace, rows: list[dict], defer
         lines.extend(contact_gating_answers(rows))
     if "stage5c" in args.stage_name or "close_retimed" in args.stage_name:
         lines.extend(close_retiming_answers(rows))
+    if "stage6" in args.stage_name or "phase_servo" in args.stage_name:
+        lines.extend(phase_servo_answers(rows))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -954,6 +1021,67 @@ def close_retiming_answers(rows: list[dict]) -> list[str]:
     ]
 
 
+def phase_servo_answers(rows: list[dict]) -> list[str]:
+    by_condition: dict[str, list[dict]] = {}
+    by_condition_speed: dict[tuple[str, float], list[dict]] = {}
+    for row in rows:
+        by_condition.setdefault(row["condition"], []).append(row)
+        by_condition_speed.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
+
+    def success_rate(group: list[dict]) -> float:
+        return float(np.mean([row["success"] for row in group])) if group else float("nan")
+
+    def count_failure(group: list[dict], label: str) -> int:
+        return sum(row["main_failure"] == label for row in group)
+
+    def no_contact(group: list[dict]) -> int:
+        return sum(not np.isfinite(row["contact_position_error_mm"]) for row in group)
+
+    base = by_condition.get("dynamic_tau0", [])
+    phase_rows = by_condition.get("dynamic_phase_servo", [])
+    base_4 = by_condition_speed.get(("dynamic_tau0", 4.0), [])
+    phase_4 = by_condition_speed.get(("dynamic_phase_servo", 4.0), [])
+    base_8 = by_condition_speed.get(("dynamic_tau0", 8.0), [])
+    phase_8 = by_condition_speed.get(("dynamic_phase_servo", 8.0), [])
+    phase_failures: dict[str, int] = {}
+    phase_failure_reasons: dict[str, int] = {}
+    for row in phase_rows:
+        phase_failures[row["main_failure"]] = phase_failures.get(row["main_failure"], 0) + 1
+        reason = row.get("phase_failure_reason", "none")
+        phase_failure_reasons[reason] = phase_failure_reasons.get(reason, 0) + 1
+    phase_timeouts = int(sum(row.get("phase_timeout", False) for row in phase_rows))
+    trigger_object = finite_mean(row.get("phase_close_trigger_ee_to_object_mm", float("nan")) for row in phase_rows)
+    trigger_target = finite_mean(row.get("phase_close_trigger_ee_to_target_mm", float("nan")) for row in phase_rows)
+    trigger_rate = float(np.mean([row.get("close_triggered", False) for row in phase_rows])) if phase_rows else float("nan")
+
+    preserves_4 = bool(base_4 and phase_4) and success_rate(phase_4) >= success_rate(base_4)
+    improves_8 = bool(base_8 and phase_8) and success_rate(phase_8) > success_rate(base_8)
+    if preserves_4 and improves_8 and phase_timeouts == 0:
+        recommendation = "PROCEED_TO_PHASE_SERVO_FORMAL"
+    elif phase_timeouts > 0 or trigger_rate == 0.0:
+        recommendation = "FIX_PHASE_SERVO_LOGIC_FIRST"
+    elif phase_rows and success_rate(phase_rows) < success_rate(base):
+        recommendation = "PHASE_SERVO_NOT_PROMISING"
+    else:
+        recommendation = "ARCHITECTURE_TOO_UNSTABLE"
+
+    return [
+        "",
+        "## Stage 6A Phase-Servo Questions",
+        "",
+        f"1. Does dynamic_phase_servo preserve the strong 4 cm/s baseline? dynamic_tau0={success_rate(base_4):.3f}, dynamic_phase_servo={success_rate(phase_4):.3f}.",
+        f"2. Does it improve 8 cm/s attempt_limit/no-contact failures? dynamic_tau0 8 cm/s success_rate={success_rate(base_8):.3f}, no_contact={no_contact(base_8)}, attempt_limit={count_failure(base_8, 'attempt_limit')}; dynamic_phase_servo 8 cm/s success_rate={success_rate(phase_8):.3f}, no_contact={no_contact(phase_8)}, attempt_limit={count_failure(phase_8, 'attempt_limit')}.",
+        f"3. Does it introduce new phase timeouts? phase_timeout_count={phase_timeouts}; phase_failure_reasons={phase_failure_reasons}.",
+        f"4. Which phase fails most often? See phase_failure_reasons above and raw_results.csv final_phase / phase_failure_reason.",
+        f"5. Are close triggers occurring at plausible EE-object and EE-target distances? trigger_rate={trigger_rate:.3f}, mean EE-object={trigger_object:.3f} mm, mean EE-target={trigger_target:.3f} mm.",
+        "6. Does the new architecture look more interpretable than dynamic_tau0? Yes if failures are attributed to explicit phase_failure_reason/final_phase rather than only attempt_limit; inspect diagnostics/*.csv phase traces.",
+        f"7. Is it promising enough for a 10-trial formal comparison? Recommendation: {recommendation}.",
+        "8. If it fails, is the failure due to phase design, thresholds, target definition, or controller tracking? Use phase timeouts, trigger distances, and EE-to-target diagnostics to separate these causes. This smoke should not be used for threshold tuning.",
+        "",
+        recommendation,
+    ]
+
+
 def write_baseline_audit(path: Path) -> None:
     lines = [
         "# Baseline Implementation Audit",
@@ -1250,6 +1378,8 @@ def log_condition_verification(conditions: list[str]) -> None:
             print("  dynamic_tau0_preclose_gated: dynamic_tau0 plus PRE_CLOSE_ALIGN gate, tau=0.0, model=CVModel, adaptive_replay=true")
         elif condition == "dynamic_tau0_close_retimed":
             print("  dynamic_tau0_close_retimed: dynamic_tau0 plus close-phase gripper retiming, tau=0.0, model=CVModel, adaptive_replay=true")
+        elif condition == "dynamic_phase_servo":
+            print("  dynamic_phase_servo: dynamic_tau0 tracker plus explicit APPROACH/PREGRASP_SERVO/CLOSE/VERIFY_ATTACH/LIFT phase controller, tau=0.0, model=CVModel")
         elif condition == "dynamic_cv":
             print("  dynamic_cv: tracker.update=true, get_target_pose=true, tau=0.1, model=CVModel, adaptive_replay=true")
         elif condition == "dynamic_ct":
@@ -1290,6 +1420,14 @@ def run_one_trial(
     close_trigger_ee_to_target_threshold_mm: float,
     retime_window_before_close_s: float,
     retime_window_after_close_s: float,
+    approach_ee_to_target_threshold_mm: float,
+    pregrasp_ee_to_target_threshold_mm: float,
+    phase_close_ee_to_object_threshold_mm: float,
+    phase_close_ee_to_target_threshold_mm: float,
+    approach_timeout_s: float,
+    pregrasp_timeout_s: float,
+    close_timeout_s: float,
+    verify_attach_timeout_s: float,
 ) -> dict:
     condition = trial_spec["condition"]
     if not trial_spec["available"]:
@@ -1330,12 +1468,41 @@ def run_one_trial(
         close_trigger_ee_to_target_threshold_mm=close_trigger_ee_to_target_threshold_mm,
         retime_window_before_close_s=retime_window_before_close_s,
         retime_window_after_close_s=retime_window_after_close_s,
+        phase_servo_enabled=bool(trial_spec.get("phase_servo_enabled", False)),
+        approach_ee_to_target_threshold_mm=approach_ee_to_target_threshold_mm,
+        pregrasp_ee_to_target_threshold_mm=pregrasp_ee_to_target_threshold_mm,
+        phase_close_ee_to_object_threshold_mm=phase_close_ee_to_object_threshold_mm,
+        phase_close_ee_to_target_threshold_mm=phase_close_ee_to_target_threshold_mm,
+        approach_timeout_s=approach_timeout_s,
+        pregrasp_timeout_s=pregrasp_timeout_s,
+        close_timeout_s=close_timeout_s,
+        verify_attach_timeout_s=verify_attach_timeout_s,
         diagnostics_path=diagnostics_path,
         attempt_diagnostics_path=attempt_diagnostics_path,
         condition_label=condition,
         seed=seed,
     )
     runtime_s = time.perf_counter() - start
+    close_trigger_sim_t = (
+        float(result.phase_close_trigger_sim_t)
+        if result.phase_controller_enabled
+        else float(result.close_trigger_sim_t)
+    )
+    close_trigger_ee_to_object_mm = (
+        float(result.phase_close_trigger_ee_to_object_mm)
+        if result.phase_controller_enabled
+        else float(result.close_trigger_ee_to_object_mm)
+    )
+    close_trigger_ee_to_target_mm = (
+        float(result.phase_close_trigger_ee_to_target_mm)
+        if result.phase_controller_enabled
+        else float(result.close_trigger_ee_to_target_mm)
+    )
+    close_trigger_t_demo = (
+        float(result.close_trigger_t_demo)
+        if not result.phase_controller_enabled
+        else float("nan")
+    )
     return {
         "condition": condition,
         "speed_cm_s": float(speed),
@@ -1380,12 +1547,27 @@ def run_one_trial(
         "close_retime_enabled": bool(result.close_retime_enabled),
         "close_retime_triggered": bool(result.close_retime_triggered),
         "close_retime_timeout": bool(result.close_retime_timeout),
-        "close_trigger_sim_t": float(result.close_trigger_sim_t),
-        "close_trigger_t_demo": float(result.close_trigger_t_demo),
-        "close_trigger_ee_to_object_mm": float(result.close_trigger_ee_to_object_mm),
-        "close_trigger_ee_to_target_mm": float(result.close_trigger_ee_to_target_mm),
+        "close_trigger_sim_t": close_trigger_sim_t,
+        "close_trigger_t_demo": close_trigger_t_demo,
+        "close_trigger_ee_to_object_mm": close_trigger_ee_to_object_mm,
+        "close_trigger_ee_to_target_mm": close_trigger_ee_to_target_mm,
         "close_retime_wait_s": float(result.close_retime_wait_s),
         "close_retime_fail_reason": result.close_retime_fail_reason,
+        "phase_controller_enabled": bool(result.phase_controller_enabled),
+        "final_phase": result.final_phase,
+        "phase_failure_reason": result.phase_failure_reason,
+        "approach_duration_s": float(result.approach_duration_s),
+        "pregrasp_duration_s": float(result.pregrasp_duration_s),
+        "close_duration_s": float(result.close_duration_s),
+        "verify_attach_duration_s": float(result.verify_attach_duration_s),
+        "lift_duration_s": float(result.lift_duration_s),
+        "n_phase_transitions": int(result.n_phase_transitions),
+        "close_triggered": bool(result.phase_close_triggered),
+        "phase_close_trigger_sim_t": float(result.phase_close_trigger_sim_t),
+        "phase_close_trigger_ee_to_target_mm": float(result.phase_close_trigger_ee_to_target_mm),
+        "phase_close_trigger_ee_to_object_mm": float(result.phase_close_trigger_ee_to_object_mm),
+        "attach_verified": bool(result.attach_verified),
+        "phase_timeout": bool(result.phase_timeout),
         "contact_position_error_mm": float(result.contact_position_error_mm),
         "orientation_error_deg": float(result.orientation_error_deg),
         "approach_error_mm": float(result.approach_max_error_mm),
@@ -1503,6 +1685,14 @@ def main() -> int:
                                 close_trigger_ee_to_target_threshold_mm=args.close_trigger_ee_to_target_threshold_mm,
                                 retime_window_before_close_s=args.retime_window_before_close_s,
                                 retime_window_after_close_s=args.retime_window_after_close_s,
+                                approach_ee_to_target_threshold_mm=args.approach_ee_to_target_threshold_mm,
+                                pregrasp_ee_to_target_threshold_mm=args.pregrasp_ee_to_target_threshold_mm,
+                                phase_close_ee_to_object_threshold_mm=args.phase_close_ee_to_object_threshold_mm,
+                                phase_close_ee_to_target_threshold_mm=args.phase_close_ee_to_target_threshold_mm,
+                                approach_timeout_s=args.approach_timeout_s,
+                                pregrasp_timeout_s=args.pregrasp_timeout_s,
+                                close_timeout_s=args.close_timeout_s,
+                                verify_attach_timeout_s=args.verify_attach_timeout_s,
                             )
                             rows.append(row)
                             append_raw_row(raw_path, row)

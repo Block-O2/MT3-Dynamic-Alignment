@@ -18,6 +18,10 @@ Use this folder as the source of record for the current baseline conclusion.
 
 `STAGE5_CODE_CLEANUP_PLAN.md` lists the experimental method additions and recommends keeping diagnostics while marking or removing failed method variants before presenting the repository as a clean baseline study.
 
+`STAGE6_PHASE_SERVO_SUMMARY.md` contains the consolidated phase-servo architecture prototype result. It records that `dynamic_phase_servo` failed to preserve the `dynamic_tau0` baseline in smoke testing and should not proceed to formal comparison.
+
+`STAGE6_CODE_CLEANUP_PLAN.md` classifies the current code paths after Stage 6A and recommends keeping `dynamic_tau0`, `static_replay`, logging, and diagnostics while marking or removing failed experimental variants.
+
 Key files:
 
 - `canonical/formal_baseline/`
@@ -25,6 +29,17 @@ Key files:
 - `STAGE4A_LATENCY_VALIDATION_SUMMARY.md`
 - `STAGE5_METHOD_EXPLORATION_SUMMARY.md`
 - `STAGE5_CODE_CLEANUP_PLAN.md`
+- `STAGE6_PHASE_SERVO_SUMMARY.md`
+- `STAGE6_CODE_CLEANUP_PLAN.md`
+
+## Current Method Status
+
+- Formal baseline: `static_replay` failed on moving objects; dynamic object-frame replay clearly outperformed static replay.
+- Tau investigation: synthetic CV validation passed, but PyBullet tracking/grasp validation did not support tau as a current simulation contribution.
+- Contact gating: freeze-style and pre-close gates were not promising.
+- Close retiming: offline oracle feasibility looked plausible, but online smoke did not reliably improve results.
+- Phase servo: architecture prototype was more interpretable but failed to preserve the baseline in smoke testing.
+- Current recommended method: `dynamic_tau0`.
 
 ## Intermediate Runs
 

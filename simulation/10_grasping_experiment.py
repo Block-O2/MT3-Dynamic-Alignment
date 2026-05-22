@@ -127,6 +127,14 @@ CLOSE_TRIGGER_EE_TO_OBJECT_THRESHOLD_MM = 40.0
 CLOSE_TRIGGER_EE_TO_TARGET_THRESHOLD_MM = 25.0
 RETIME_WINDOW_BEFORE_CLOSE_S = 0.5
 RETIME_WINDOW_AFTER_CLOSE_S = 1.0
+PHASE_APPROACH_EE_TO_TARGET_THRESHOLD_MM = 30.0
+PHASE_PREGRASP_EE_TO_TARGET_THRESHOLD_MM = 20.0
+PHASE_CLOSE_EE_TO_OBJECT_THRESHOLD_MM = 40.0
+PHASE_CLOSE_EE_TO_TARGET_THRESHOLD_MM = 25.0
+PHASE_APPROACH_TIMEOUT_S = 4.0
+PHASE_PREGRASP_TIMEOUT_S = 3.0
+PHASE_CLOSE_TIMEOUT_S = 1.5
+PHASE_VERIFY_ATTACH_TIMEOUT_S = 1.0
 
 
 class GraspDemo(NamedTuple):
@@ -184,6 +192,21 @@ class TrialResult(NamedTuple):
     close_trigger_ee_to_target_mm: float = float("nan")
     close_retime_wait_s: float = 0.0
     close_retime_fail_reason: str = "disabled"
+    phase_controller_enabled: bool = False
+    final_phase: str = "disabled"
+    phase_failure_reason: str = "disabled"
+    approach_duration_s: float = 0.0
+    pregrasp_duration_s: float = 0.0
+    close_duration_s: float = 0.0
+    verify_attach_duration_s: float = 0.0
+    lift_duration_s: float = 0.0
+    n_phase_transitions: int = 0
+    phase_close_triggered: bool = False
+    phase_close_trigger_sim_t: float = float("nan")
+    phase_close_trigger_ee_to_target_mm: float = float("nan")
+    phase_close_trigger_ee_to_object_mm: float = float("nan")
+    attach_verified: bool = False
+    phase_timeout: bool = False
 
 
 def moving_box_position(t: float, speed_cm_s: float) -> np.ndarray:
@@ -618,6 +641,15 @@ def run_trial(
     close_trigger_ee_to_target_threshold_mm: float = CLOSE_TRIGGER_EE_TO_TARGET_THRESHOLD_MM,
     retime_window_before_close_s: float = RETIME_WINDOW_BEFORE_CLOSE_S,
     retime_window_after_close_s: float = RETIME_WINDOW_AFTER_CLOSE_S,
+    phase_servo_enabled: bool = False,
+    approach_ee_to_target_threshold_mm: float = PHASE_APPROACH_EE_TO_TARGET_THRESHOLD_MM,
+    pregrasp_ee_to_target_threshold_mm: float = PHASE_PREGRASP_EE_TO_TARGET_THRESHOLD_MM,
+    phase_close_ee_to_object_threshold_mm: float = PHASE_CLOSE_EE_TO_OBJECT_THRESHOLD_MM,
+    phase_close_ee_to_target_threshold_mm: float = PHASE_CLOSE_EE_TO_TARGET_THRESHOLD_MM,
+    approach_timeout_s: float = PHASE_APPROACH_TIMEOUT_S,
+    pregrasp_timeout_s: float = PHASE_PREGRASP_TIMEOUT_S,
+    close_timeout_s: float = PHASE_CLOSE_TIMEOUT_S,
+    verify_attach_timeout_s: float = PHASE_VERIFY_ATTACH_TIMEOUT_S,
     diagnostics_path: Path | None = None,
     attempt_diagnostics_path: Path | None = None,
     condition_label: str | None = None,
@@ -636,6 +668,17 @@ def run_trial(
         raise ValueError("close trigger thresholds must be non-negative")
     if retime_window_before_close_s < 0 or retime_window_after_close_s < 0:
         raise ValueError("retime windows must be non-negative")
+    if min(
+        approach_ee_to_target_threshold_mm,
+        pregrasp_ee_to_target_threshold_mm,
+        phase_close_ee_to_object_threshold_mm,
+        phase_close_ee_to_target_threshold_mm,
+        approach_timeout_s,
+        pregrasp_timeout_s,
+        close_timeout_s,
+        verify_attach_timeout_s,
+    ) < 0:
+        raise ValueError("phase-servo thresholds and timeouts must be non-negative")
 
     client_id = p.connect(p.GUI if USE_GUI else p.DIRECT)
     if client_id < 0:
@@ -722,6 +765,25 @@ def run_trial(
         close_trigger_ee_to_target_mm = float("nan")
         close_retime_wait_s = 0.0
         close_retime_fail_reason = "disabled" if not close_retime_enabled else "not_reached"
+        phase = "APPROACH" if phase_servo_enabled else "disabled"
+        final_phase = phase
+        phase_failure_reason = "none" if phase_servo_enabled else "disabled"
+        phase_timeout = False
+        phase_start_sim_t = 0.0
+        phase_durations = {
+            "APPROACH": 0.0,
+            "PREGRASP_SERVO": 0.0,
+            "CLOSE": 0.0,
+            "VERIFY_ATTACH": 0.0,
+            "LIFT": 0.0,
+        }
+        n_phase_transitions = 0
+        phase_close_triggered = False
+        phase_close_trigger_sim_t = float("nan")
+        phase_close_trigger_ee_to_target_mm = float("nan")
+        phase_close_trigger_ee_to_object_mm = float("nan")
+        attach_verified = False
+        phase_lift_start_sim_t = float("nan")
         diagnostic_rows: list[dict[str, object]] = []
         attempt_diagnostic_rows: list[dict[str, object]] = []
         aborted_by_attempt_limit = False
@@ -794,57 +856,202 @@ def run_trial(
                                 float(np.linalg.norm(estimated_delta_xy - true_delta_xy) * 1000.0),
                             )
                         )
-                    alignment_pose = tracker.get_target_pose(
-                        demo.poses,
-                        t_demo=0.0,
-                        tau=replay_tau,
-                    )
-                    alignment_target = np.asarray(alignment_pose[:3, 3], dtype=float)
-                    lateral_error_mm = float(
-                        np.linalg.norm((ee_pos_before_command - alignment_target)[:2]) * 1000.0
-                    )
-                    smoothed_lateral_error_mm = smooth_append(
-                        lateral_error_window,
-                        lateral_error_mm,
-                        LATERAL_ERROR_SMOOTHING_FRAMES,
-                    )
-                    proposed_t_demo = min(demo_clock[0] + sim03.DT, demo.poses.duration)
-                    previous_progress_sum = tracker._adaptive_progress_sum
-                    if (
-                        contact_gate_enabled
-                        and contact_gate_mode == "preclose"
-                        and constraint_id is None
-                        and not gate_close_allowed
-                        and proposed_t_demo >= DEMO_APPROACH_DURATION
-                    ):
-                        preclose_t_demo = max(0.0, DEMO_APPROACH_DURATION - sim03.DT)
-                        demo_clock[0] = preclose_t_demo
-                        target_pose = tracker.get_target_pose(
+                    if phase_servo_enabled:
+                        phase_elapsed_s = replay_t - phase_start_sim_t
+                        pregrasp_t_demo = max(0.0, DEMO_APPROACH_DURATION - sim03.DT)
+                        approach_t_demo = max(0.0, DEMO_APPROACH_DURATION * 0.6)
+                        box_pos_for_phase = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+
+                        if phase == "APPROACH":
+                            t_demo_for_phase = approach_t_demo
+                            target_pose = tracker.get_target_pose(demo.poses, t_demo=t_demo_for_phase, tau=0.0)
+                            target_pos_for_phase = np.asarray(target_pose[:3, 3], dtype=float)
+                            phase_ee_to_target_mm = float(
+                                np.linalg.norm((ee_pos_before_command - target_pos_for_phase)[:2]) * 1000.0
+                            )
+                            if phase_ee_to_target_mm <= approach_ee_to_target_threshold_mm:
+                                phase_durations["APPROACH"] += phase_elapsed_s
+                                phase = "PREGRASP_SERVO"
+                                final_phase = phase
+                                phase_start_sim_t = replay_t
+                                n_phase_transitions += 1
+                                t_demo_for_phase = pregrasp_t_demo
+                                target_pose = tracker.get_target_pose(demo.poses, t_demo=t_demo_for_phase, tau=0.0)
+                            elif phase_elapsed_s >= approach_timeout_s:
+                                phase_durations["APPROACH"] += phase_elapsed_s
+                                phase = "FAILED"
+                                final_phase = phase
+                                phase_failure_reason = "approach_timeout"
+                                phase_timeout = True
+                                aborted_by_attempt_limit = True
+                                break
+                        elif phase == "PREGRASP_SERVO":
+                            t_demo_for_phase = pregrasp_t_demo
+                            target_pose = tracker.get_target_pose(demo.poses, t_demo=t_demo_for_phase, tau=0.0)
+                            target_pos_for_phase = np.asarray(target_pose[:3, 3], dtype=float)
+                            phase_ee_to_target_mm = float(
+                                np.linalg.norm((ee_pos_before_command - target_pos_for_phase)[:2]) * 1000.0
+                            )
+                            phase_ee_to_object_mm = float(
+                                np.linalg.norm((ee_pos_before_command - box_pos_for_phase)[:2]) * 1000.0
+                            )
+                            target_ok = phase_ee_to_target_mm <= min(
+                                pregrasp_ee_to_target_threshold_mm,
+                                phase_close_ee_to_target_threshold_mm,
+                            )
+                            object_ok = phase_ee_to_object_mm <= phase_close_ee_to_object_threshold_mm
+                            if target_ok and object_ok:
+                                phase_durations["PREGRASP_SERVO"] += phase_elapsed_s
+                                phase = "CLOSE"
+                                final_phase = phase
+                                phase_start_sim_t = replay_t
+                                n_phase_transitions += 1
+                                phase_close_triggered = True
+                                phase_close_trigger_sim_t = replay_t
+                                phase_close_trigger_ee_to_target_mm = phase_ee_to_target_mm
+                                phase_close_trigger_ee_to_object_mm = phase_ee_to_object_mm
+                                t_demo_for_phase = DEMO_APPROACH_DURATION
+                                target_pose = tracker.get_target_pose(demo.poses, t_demo=pregrasp_t_demo, tau=0.0)
+                            elif phase_elapsed_s >= pregrasp_timeout_s:
+                                phase_durations["PREGRASP_SERVO"] += phase_elapsed_s
+                                phase = "FAILED"
+                                final_phase = phase
+                                phase_failure_reason = "pregrasp_timeout"
+                                phase_timeout = True
+                                aborted_by_attempt_limit = True
+                                break
+                        elif phase == "CLOSE":
+                            if constraint_id is not None:
+                                phase_durations["CLOSE"] += phase_elapsed_s
+                                phase = "VERIFY_ATTACH"
+                                final_phase = phase
+                                phase_start_sim_t = replay_t
+                                n_phase_transitions += 1
+                                phase_elapsed_s = 0.0
+                            if phase == "CLOSE" and phase_elapsed_s >= close_timeout_s:
+                                phase_durations["CLOSE"] += phase_elapsed_s
+                                phase = "FAILED"
+                                final_phase = phase
+                                phase_failure_reason = "close_timeout"
+                                phase_timeout = True
+                                aborted_by_attempt_limit = True
+                                break
+                            t_demo_for_phase = min(
+                                DEMO_APPROACH_DURATION + min(phase_elapsed_s, DEMO_CLOSE_DURATION),
+                                demo.poses.duration,
+                            )
+                            target_pose = tracker.get_target_pose(demo.poses, t_demo=pregrasp_t_demo, tau=0.0)
+                        elif phase == "VERIFY_ATTACH":
+                            t_demo_for_phase = DEMO_APPROACH_DURATION + DEMO_CLOSE_DURATION
+                            target_pose = tracker.get_target_pose(demo.poses, t_demo=pregrasp_t_demo, tau=0.0)
+                            if constraint_id is not None:
+                                attach_verified = True
+                                phase_durations["VERIFY_ATTACH"] += phase_elapsed_s
+                                phase = "LIFT"
+                                final_phase = phase
+                                phase_start_sim_t = replay_t
+                                phase_lift_start_sim_t = replay_t
+                                n_phase_transitions += 1
+                            elif phase_elapsed_s >= verify_attach_timeout_s:
+                                phase_durations["VERIFY_ATTACH"] += phase_elapsed_s
+                                phase = "FAILED"
+                                final_phase = phase
+                                phase_failure_reason = "attach_failed"
+                                phase_timeout = True
+                                aborted_by_attempt_limit = True
+                                break
+                        elif phase == "LIFT":
+                            lift_elapsed_s = replay_t - phase_lift_start_sim_t
+                            phase_durations["LIFT"] = lift_elapsed_s
+                            t_demo_for_phase = min(
+                                DEMO_APPROACH_DURATION + DEMO_CLOSE_DURATION + lift_elapsed_s,
+                                demo.poses.duration,
+                            )
+                            target_pose = tracker.get_target_pose(demo.poses, t_demo=t_demo_for_phase, tau=0.0)
+                            if lift_elapsed_s >= DEMO_LIFT_DURATION:
+                                phase = "DONE"
+                                final_phase = phase
+                                n_phase_transitions += 1
+                        else:
+                            t_demo_for_phase = demo_clock[0]
+                            target_pose = demo.poses.get_pose_at(t_demo_for_phase)
+                        demo_clock[0] = t_demo_for_phase
+                        lateral_error_mm = float("nan")
+                        frame_progress_rate = 1.0
+                    else:
+                        alignment_pose = tracker.get_target_pose(
                             demo.poses,
-                            t_demo=preclose_t_demo,
+                            t_demo=0.0,
                             tau=replay_tau,
                         )
-                        if not np.isfinite(gate_wait_start_sim_t):
-                            gate_wait_start_sim_t = replay_t
-                        contact_gate_wait_s = replay_t - gate_wait_start_sim_t
-                        target_pos_for_gate = np.asarray(target_pose[:3, 3], dtype=float)
-                        box_pos_for_gate = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
-                        ee_to_target_at_gate_mm = float(
-                            np.linalg.norm((ee_pos_before_command - target_pos_for_gate)[:2]) * 1000.0
+                        alignment_target = np.asarray(alignment_pose[:3, 3], dtype=float)
+                        lateral_error_mm = float(
+                            np.linalg.norm((ee_pos_before_command - alignment_target)[:2]) * 1000.0
                         )
-                        ee_to_object_at_gate_mm = float(
-                            np.linalg.norm((ee_pos_before_command - box_pos_for_gate)[:2]) * 1000.0
+                        smoothed_lateral_error_mm = smooth_append(
+                            lateral_error_window,
+                            lateral_error_mm,
+                            LATERAL_ERROR_SMOOTHING_FRAMES,
                         )
-                        target_ok = ee_to_target_at_gate_mm <= contact_gate_ee_to_target_xy_threshold_mm
-                        object_ok = ee_to_object_at_gate_mm <= contact_gate_ee_to_object_xy_threshold_mm
-                        if target_ok and object_ok:
-                            gate_close_allowed = True
-                            contact_gate_passed = True
-                            gate_fail_reason = "none"
-                            close_allowed_sim_t = replay_t
-                            close_allowed_t_demo = proposed_t_demo
+                        proposed_t_demo = min(demo_clock[0] + sim03.DT, demo.poses.duration)
+                        previous_progress_sum = tracker._adaptive_progress_sum
+                        if (
+                            contact_gate_enabled
+                            and contact_gate_mode == "preclose"
+                            and constraint_id is None
+                            and not gate_close_allowed
+                            and proposed_t_demo >= DEMO_APPROACH_DURATION
+                        ):
+                            preclose_t_demo = max(0.0, DEMO_APPROACH_DURATION - sim03.DT)
+                            demo_clock[0] = preclose_t_demo
+                            target_pose = tracker.get_target_pose(
+                                demo.poses,
+                                t_demo=preclose_t_demo,
+                                tau=replay_tau,
+                            )
+                            if not np.isfinite(gate_wait_start_sim_t):
+                                gate_wait_start_sim_t = replay_t
+                            contact_gate_wait_s = replay_t - gate_wait_start_sim_t
+                            target_pos_for_gate = np.asarray(target_pose[:3, 3], dtype=float)
+                            box_pos_for_gate = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+                            ee_to_target_at_gate_mm = float(
+                                np.linalg.norm((ee_pos_before_command - target_pos_for_gate)[:2]) * 1000.0
+                            )
+                            ee_to_object_at_gate_mm = float(
+                                np.linalg.norm((ee_pos_before_command - box_pos_for_gate)[:2]) * 1000.0
+                            )
+                            target_ok = ee_to_target_at_gate_mm <= contact_gate_ee_to_target_xy_threshold_mm
+                            object_ok = ee_to_object_at_gate_mm <= contact_gate_ee_to_object_xy_threshold_mm
+                            if target_ok and object_ok:
+                                gate_close_allowed = True
+                                contact_gate_passed = True
+                                gate_fail_reason = "none"
+                                close_allowed_sim_t = replay_t
+                                close_allowed_t_demo = proposed_t_demo
+                                demo_clock[0] = proposed_t_demo
+                                adaptive_threshold_mm = CONTACT_POSITION_TOLERANCE_M * 1000.0
+                                target_pose, _ = tracker.get_target_pose_adaptive(
+                                    demo.poses,
+                                    t_demo=demo_clock,
+                                    lateral_error_mm=smoothed_lateral_error_mm,
+                                    threshold_mm=adaptive_threshold_mm,
+                                    tau=replay_tau,
+                                )
+                            elif contact_gate_wait_s >= contact_gate_max_wait_s:
+                                contact_gate_timeout = True
+                                gate_fail_reason = "ee_to_target" if not target_ok else "ee_to_object"
+                                aborted_by_attempt_limit = True
+                                break
+                            else:
+                                gate_fail_reason = "ee_to_target" if not target_ok else "ee_to_object"
+                                n_gate_freeze_frames += 1
+                        else:
                             demo_clock[0] = proposed_t_demo
-                            adaptive_threshold_mm = CONTACT_POSITION_TOLERANCE_M * 1000.0
+                            adaptive_threshold_mm = (
+                                DESCENT_GATE_THRESHOLD_M * 1000.0
+                                if is_descent_phase(demo.poses, demo_clock[0])
+                                else CONTACT_POSITION_TOLERANCE_M * 1000.0
+                            )
                             target_pose, _ = tracker.get_target_pose_adaptive(
                                 demo.poses,
                                 t_demo=demo_clock,
@@ -852,29 +1059,7 @@ def run_trial(
                                 threshold_mm=adaptive_threshold_mm,
                                 tau=replay_tau,
                             )
-                        elif contact_gate_wait_s >= contact_gate_max_wait_s:
-                            contact_gate_timeout = True
-                            gate_fail_reason = "ee_to_target" if not target_ok else "ee_to_object"
-                            aborted_by_attempt_limit = True
-                            break
-                        else:
-                            gate_fail_reason = "ee_to_target" if not target_ok else "ee_to_object"
-                            n_gate_freeze_frames += 1
-                    else:
-                        demo_clock[0] = proposed_t_demo
-                        adaptive_threshold_mm = (
-                            DESCENT_GATE_THRESHOLD_M * 1000.0
-                            if is_descent_phase(demo.poses, demo_clock[0])
-                            else CONTACT_POSITION_TOLERANCE_M * 1000.0
-                        )
-                        target_pose, _ = tracker.get_target_pose_adaptive(
-                            demo.poses,
-                            t_demo=demo_clock,
-                            lateral_error_mm=smoothed_lateral_error_mm,
-                            threshold_mm=adaptive_threshold_mm,
-                            tau=replay_tau,
-                        )
-                    frame_progress_rate = tracker._adaptive_progress_sum - previous_progress_sum
+                        frame_progress_rate = tracker._adaptive_progress_sum - previous_progress_sum
                     if DEBUG_ADAPTIVE_GATE and frame_idx % 30 == 0:
                         print(
                             f"adaptive debug frame={frame_idx:03d} "
@@ -1164,6 +1349,7 @@ def run_trial(
                         "seed": seed,
                         "t_demo": t_demo,
                         "replay_phase": "moving" if moving_object else "static",
+                        "phase": phase,
                         "gripper_width": gripper_width,
                         "object_gt_x": box_pos_after_step[0],
                         "object_gt_y": box_pos_after_step[1],
@@ -1206,6 +1392,9 @@ def run_trial(
                         "close_trigger_t_demo": close_trigger_t_demo,
                         "close_retime_wait_s": close_retime_wait_s,
                         "close_retime_fail_reason": close_retime_fail_reason,
+                        "phase_controller_enabled": int(phase_servo_enabled),
+                        "phase_close_triggered": int(phase_close_triggered),
+                        "attach_verified": int(attach_verified),
                     }
                 )
 
@@ -1271,6 +1460,7 @@ def run_trial(
             "seed",
             "t_demo",
             "replay_phase",
+            "phase",
             "gripper_width",
             "object_gt_x",
             "object_gt_y",
@@ -1307,6 +1497,9 @@ def run_trial(
             "close_trigger_t_demo",
             "close_retime_wait_s",
             "close_retime_fail_reason",
+            "phase_controller_enabled",
+            "phase_close_triggered",
+            "attach_verified",
         ]
         with diagnostics_path.open("w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -1317,9 +1510,24 @@ def run_trial(
     max_lift_m = max_box_z - float(STATIC_BOX_POS[2])
     lift_success = final_lift_m > LIFT_SUCCESS_MARGIN
     success = lift_success and position_success and orientation_success and approach_success
+    if phase_servo_enabled and phase not in {"FAILED", "DONE"}:
+        final_phase = phase
+    if phase_servo_enabled and not success and phase_failure_reason == "none" and not phase_timeout:
+        if not lift_success:
+            phase_failure_reason = "lift_failed"
+        elif not position_success:
+            phase_failure_reason = "position_failed"
+        elif not orientation_success:
+            phase_failure_reason = "orientation_failed"
+        elif not approach_success:
+            phase_failure_reason = "approach_failed"
+        else:
+            phase_failure_reason = "unknown"
     main_failure_for_attempts = "none"
     if not success:
-        if contact_gate_timeout:
+        if phase_servo_enabled and phase_timeout:
+            main_failure_for_attempts = phase_failure_reason
+        elif contact_gate_timeout:
             main_failure_for_attempts = "contact_gate_timeout"
         elif aborted_by_attempt_limit:
             main_failure_for_attempts = "attempt_limit"
@@ -1475,6 +1683,21 @@ def run_trial(
         close_trigger_ee_to_target_mm=close_trigger_ee_to_target_mm,
         close_retime_wait_s=close_retime_wait_s,
         close_retime_fail_reason=close_retime_fail_reason,
+        phase_controller_enabled=phase_servo_enabled,
+        final_phase=final_phase,
+        phase_failure_reason=phase_failure_reason,
+        approach_duration_s=phase_durations["APPROACH"],
+        pregrasp_duration_s=phase_durations["PREGRASP_SERVO"],
+        close_duration_s=phase_durations["CLOSE"],
+        verify_attach_duration_s=phase_durations["VERIFY_ATTACH"],
+        lift_duration_s=phase_durations["LIFT"],
+        n_phase_transitions=n_phase_transitions,
+        phase_close_triggered=phase_close_triggered,
+        phase_close_trigger_sim_t=phase_close_trigger_sim_t,
+        phase_close_trigger_ee_to_target_mm=phase_close_trigger_ee_to_target_mm,
+        phase_close_trigger_ee_to_object_mm=phase_close_trigger_ee_to_object_mm,
+        attach_verified=attach_verified,
+        phase_timeout=phase_timeout,
     )
 
 
@@ -1482,6 +1705,8 @@ def trial_main_failure(result: TrialResult) -> str:
     """Return the primary failed success condition for one trial."""
     if result.success:
         return "none"
+    if result.phase_controller_enabled and result.phase_timeout:
+        return result.phase_failure_reason
     if result.contact_gate_timeout:
         return "contact_gate_timeout"
     if result.attempt_limit_failure:
