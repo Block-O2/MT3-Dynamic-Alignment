@@ -299,6 +299,72 @@ class TestGetTargetPose:
         # 有补偿的目标 X 分量应 > 无补偿
         assert T_with_comp[0, 3] != T_no_comp[0, 3]
 
+    def test_adaptive_replay_slows_demo_time_when_lateral_error_high(self):
+        """误差升高时，自适应重放应按连续 progress_rate 放慢 demo timestamp。"""
+        tracker = DynamicAlignmentTracker(tau=0.0)
+        tracker.init(self.cloud0, initial_theta=0.0, timestamp=0.0)
+        demo = _make_identity_demo()
+
+        t_demo = [0.2]
+        _, advanced = tracker.get_target_pose_adaptive(
+            demo,
+            t_demo=t_demo,
+            lateral_error_mm=5.0,
+            threshold_mm=15.0,
+        )
+        assert advanced is True
+        assert t_demo[0] == pytest.approx(0.2)
+
+        t_demo[0] = 0.4
+        _, advanced = tracker.get_target_pose_adaptive(
+            demo,
+            t_demo=t_demo,
+            lateral_error_mm=25.0,
+            threshold_mm=15.0,
+        )
+        assert advanced is True
+        assert t_demo[0] == pytest.approx(0.3)
+
+        t_demo[0] = 0.5
+        _, advanced = tracker.get_target_pose_adaptive(
+            demo,
+            t_demo=t_demo,
+            lateral_error_mm=35.0,
+            threshold_mm=15.0,
+        )
+        assert advanced is False
+        assert t_demo[0] == pytest.approx(0.3)
+
+    def test_adaptive_progress_rate_averages_continuous_rates(self):
+        """progress_rate 应统计连续自适应速率的平均值。"""
+        tracker = DynamicAlignmentTracker(tau=0.0)
+        tracker.init(self.cloud0, initial_theta=0.0, timestamp=0.0)
+        demo = _make_identity_demo()
+        t_demo = [0.0]
+
+        for error_mm in (5.0, 25.0, 40.0):
+            t_demo[0] += 0.1
+            tracker.get_target_pose_adaptive(
+                demo,
+                t_demo=t_demo,
+                lateral_error_mm=error_mm,
+                threshold_mm=15.0,
+            )
+
+        assert tracker.progress_rate == pytest.approx(0.5)
+
+    def test_adaptive_replay_requires_mutable_timestamp(self):
+        """t_demo 必须可变，否则无法跨帧冻结 caller 的 demo clock。"""
+        tracker = DynamicAlignmentTracker(tau=0.0)
+        tracker.init(self.cloud0, initial_theta=0.0, timestamp=0.0)
+
+        with pytest.raises(TypeError, match="mutable"):
+            tracker.get_target_pose_adaptive(
+                _make_identity_demo(),
+                t_demo=0.1,
+                lateral_error_mm=0.0,
+            )
+
 
 # ---------------------------------------------------------------------------
 # 圆周轨迹全链路测试

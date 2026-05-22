@@ -95,6 +95,10 @@ class DynamicAlignmentTracker:
 
         self._last_timestamp: float | None = None
         self._initialized:    bool         = False
+        self._adaptive_total_frames: int = 0
+        self._adaptive_advanced_frames: int = 0
+        self._adaptive_progress_sum: float = 0.0
+        self._adaptive_last_t_demo: float | None = None
 
     # ------------------------------------------------------------------
     # 初始化（GICP 对准完成后调用一次）
@@ -137,6 +141,10 @@ class DynamicAlignmentTracker:
 
         self._last_timestamp = float(timestamp)
         self._initialized    = True
+        self._adaptive_total_frames = 0
+        self._adaptive_advanced_frames = 0
+        self._adaptive_progress_sum = 0.0
+        self._adaptive_last_t_demo = None
 
     # ------------------------------------------------------------------
     # 每帧更新
@@ -234,6 +242,74 @@ class DynamicAlignmentTracker:
         # 核心公式
         return T_delta @ T_demo
 
+    def get_target_pose_adaptive(
+        self,
+        demo_data: DemoData,
+        t_demo,
+        lateral_error_mm: float,
+        threshold_mm: float = 15.0,
+        tau: float | None = None,
+    ) -> tuple[np.ndarray, bool]:
+        """
+        Adaptive demo replay that couples tracking quality with demo progression.
+
+        Demo progression is slowed continuously as lateral error grows:
+
+            progress_rate = clip(1 - (error_mm - threshold_mm) / 20, 0, 1)
+
+        With the default threshold, error < 15mm advances at full speed,
+        25mm advances at half speed, and >=35mm freezes progression.
+
+        Args:
+            demo_data: DemoData object.
+            t_demo: mutable demo timestamp container, e.g. [t]. The caller should
+                propose the next demo timestamp in t_demo[0]; this method writes
+                back the adapted timestamp after applying progress_rate.
+            lateral_error_mm: current lateral tracking error in mm.
+            threshold_mm: max allowed error before freezing demo progression.
+            tau: prediction horizon. None uses self.tau.
+
+        Returns:
+            T_WE_target: 4x4 target pose.
+            demo_advanced: whether demo timestamp advanced by a nonzero amount.
+        """
+        if not self._initialized:
+            raise RuntimeError("Tracker 未初始化，请先调用 init()")
+
+        if not hasattr(t_demo, "__getitem__") or not hasattr(t_demo, "__setitem__"):
+            raise TypeError(
+                "t_demo must be a mutable timestamp container, e.g. [current_t_demo]"
+            )
+
+        self._adaptive_total_frames += 1
+        proposed_t_demo = float(t_demo[0])
+        lateral_error_mm = float(lateral_error_mm)
+        threshold_mm = float(threshold_mm)
+
+        progress_rate = 1.0 - (lateral_error_mm - threshold_mm) / 20.0
+        progress_rate = float(np.clip(progress_rate, 0.0, 1.0))
+        previous_t_demo = (
+            self._adaptive_last_t_demo
+            if self._adaptive_last_t_demo is not None
+            else float(demo_data.timestamps[0])
+        )
+        proposed_dt = max(0.0, proposed_t_demo - previous_t_demo)
+        active_t_demo = previous_t_demo + proposed_dt * progress_rate
+        t_demo[0] = active_t_demo
+
+        self._adaptive_progress_sum += progress_rate
+        demo_advanced = active_t_demo > previous_t_demo
+        if demo_advanced:
+            self._adaptive_advanced_frames += 1
+        self._adaptive_last_t_demo = active_t_demo
+
+        target_pose = self.get_target_pose(
+            demo_data=demo_data,
+            t_demo=active_t_demo,
+            tau=tau,
+        )
+        return target_pose, demo_advanced
+
     # ------------------------------------------------------------------
     # 调试 / 集成辅助
     # ------------------------------------------------------------------
@@ -257,6 +333,13 @@ class DynamicAlignmentTracker:
     def current_state(self) -> TrackerState | None:
         """当前 Kalman 状态的只读副本"""
         return self._kf.state
+
+    @property
+    def progress_rate(self) -> float:
+        """Mean adaptive demo progress rate across calls."""
+        if self._adaptive_total_frames == 0:
+            return 0.0
+        return self._adaptive_progress_sum / self._adaptive_total_frames
 
     @property
     def is_initialized(self) -> bool:
