@@ -120,7 +120,7 @@ MT3_dynamic_alignment/
 │
 ├── tests/                      Hardware-free unit tests
 ├── MT3_dynamic_alignment_notes.md
-└── 2305.05926v1.pdf            MT3 paper
+└── 2511.10110v1.pdf            MT3 paper
 ```
 
 ## Quick Start

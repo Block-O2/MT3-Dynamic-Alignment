@@ -120,7 +120,7 @@ MT3_dynamic_alignment/
 │
 ├── tests/                      无硬件依赖的单元测试
 ├── MT3_dynamic_alignment_notes.md
-└── 2305.05926v1.pdf            MT3 论文
+└── 2511.10110v1.pdf            MT3 论文
 ```
 
 ## 快速开始
