@@ -1,174 +1,136 @@
 # MT3 Dynamic Alignment
 
-Continuous object tracking and latency-compensated demo replay for applying a static MT3 manipulation demonstration to moving objects.
+Simulation-only research prototype for object-frame replay of a static manipulation demonstration on slowly moving tabletop objects.
 
-> **Status:** Core algorithm implemented and validated in PyBullet simulation. Hardware validation on Sawyer + RealSense D415 is pending.
+## Current Status
 
-## Demo
+This repository currently supports a controlled PyBullet simulation study. It does not validate real robot behavior, RealSense perception, real contact dynamics, or robust hardware deployment.
 
-![Franka Panda grasping a moving object in PyBullet](simulation/results/plot/grasping_demo.gif)
-
-Franka Panda replays a grasp demonstrated on a static object while the object moves on a tabletop. No retraining is used.
-
-## Core Formula
+The current strongest reliable method is:
 
 ```text
-T_WE_target(t) = T_delta(t + tau) · T_WE_demo(t)
+dynamic_tau0
 ```
 
-`T_WE_demo(t)` is the end-effector pose sequence recorded by MT3 on a static object. `T_delta(t + tau)` is the tracked object motion predicted ahead by the system latency `tau`, so the robot executes the demo in the moving object's frame instead of chasing stale observations.
+The canonical formal baseline and consolidated exploration summary are stored under:
 
-## Key Results
+```text
+simulation/results/
+├── canonical/formal_baseline/
+├── FINAL_EXPLORATION_SUMMARY.md
+├── FINAL_CODE_CLEANUP_PLAN.md
+└── README_RESULTS.md
+```
 
-### End-to-End Grasping
+The formal baseline uses a PyBullet fixed-constraint grasp attachment once the gripper closes near the object. This is a simulation artifact and should not be presented as real contact validation.
 
-![Grasping Success Rate](simulation/results/plot/grasping_success_rate.png)
+## Supported Claim
 
-The final grasping experiment shows an inverted-U speed response: 4-6 cm/s is the best operating range, while very slow motion gives a weak velocity signal and fast motion reaches the controller bandwidth limit.
+The honest claim supported by the current repository is limited to:
 
-### Latency Compensation
+> Under controlled PyBullet tabletop simulations, dynamic object-frame replay can be compared against static replay and prediction baselines for slowly moving planar objects.
 
-![Baseline Comparison](simulation/results/plot/baseline_comparison.png)
+Do not interpret the current results as real robot validation, full dynamic manipulation, or a complete MT3 extension.
 
-Predicting 100 ms ahead reduces relative tracking error compared with pure reactive control.
+## Formal Baseline Summary
 
-### Robustness
+The formal baseline compared:
 
-![Robustness Analysis](simulation/results/plot/robustness_analysis.png)
+- `static_replay`
+- `dynamic_tau0`
+- `dynamic_cv`
+- `dynamic_ct`
 
-Kalman filtering remains stable under noisy observations, especially when velocity feedforward is degraded by outliers.
+Speeds:
 
-### Method Comparison
+- 2.0, 4.0, 6.0, 8.0 cm/s
 
-![Method Comparison](simulation/results/plot/method_comparison_bar.png)
+Trials:
 
-The Kalman + prediction method matches or exceeds the alternative controllers while providing the most reliable steady-state behavior.
+- 10 trials per condition per speed
 
-<details>
-<summary>Full Experiment Results</summary>
+Key conclusions:
 
-### Tracker Simulation
+- `static_replay` failed at all tested speeds on moving objects.
+- Dynamic object-frame replay clearly outperformed static replay.
+- `dynamic_tau0` was the strongest reliable baseline.
+- `dynamic_cv` / tau prediction did not outperform `dynamic_tau0` in the latency-free PyBullet setup.
+- `dynamic_ct` did not meaningfully differ from `dynamic_cv`.
+- Dominant failures were `attempt_limit` / no-contact.
 
-![XY Trajectory](simulation/results/plot/trajectory_xy.png)
-![Position Error](simulation/results/plot/position_error.png)
+See [`simulation/results/FINAL_EXPLORATION_SUMMARY.md`](simulation/results/FINAL_EXPLORATION_SUMMARY.md) for the full interpretation.
 
-The overhead RGB-D simulation tracks a box moving in a circle with millimeter-level steady-state error.
+## Exploratory Methods
 
-### Closed-Loop Panda Tracking
+The following variants are retained only for transparency and diagnostics. They should not be presented as successful methods:
 
-![Closed-loop 3D trajectories](simulation/results/plot/closed_loop_3d_trajectories.png)
-![Closed-loop relative error](simulation/results/plot/closed_loop_relative_error.png)
+- tau / latency compensation in the current PyBullet grasp setup
+- `dynamic_tau0_contact_gated`
+- `dynamic_tau0_preclose_gated`
+- `dynamic_tau0_close_retimed`
+- `dynamic_phase_servo`
+- `feasibility_aware_replay`
+- `feasibility_aware_replay_v2`
 
-The Panda end-effector maintains a constant relative pose to the moving object using tracker output.
-
-### Static Demo to Moving Object
-
-![MT3 Integration Error](simulation/results/plot/mt3_integration_error.png)
-![MT3 Integration Trajectory](simulation/results/plot/mt3_integration_trajectory.png)
-
-A trajectory demonstrated on a static object is replayed on a moving object in the object frame.
-
-### Speed and Motion Sensitivity
-
-![Speed Sensitivity](simulation/results/plot/speed_sensitivity.png)
-![Motion Type Comparison](simulation/results/plot/motion_type_comparison.png)
-
-The system remains effective across multiple object speeds and motion patterns, with degradation near reversal points and high-speed limits.
-
-### Additional Test Figures
-
-![Convergence](simulation/results/plot/convergence.png)
-![Latency Compensation Test](simulation/results/plot/latency_compensation.png)
-![Tracking Comparison](simulation/results/plot/tracking_comparison.png)
-![Method Error Over Time](simulation/results/plot/method_comparison_time.png)
-
-Raw final grasping data is stored at [`simulation/results/raw/10_grasping_final_seed42.csv`](simulation/results/raw/10_grasping_final_seed42.csv).
-
-</details>
-
-## How It Works
-
-The tracker estimates how the object has moved since the static demonstration was recorded. A Kalman filter smooths this motion estimate and predicts slightly into the future to compensate for camera, computation, and actuation latency. The robot then transforms every demo pose by the predicted object motion, so the same recorded action follows the moving object. For grasping, adaptive replay can slow the demo when alignment is poor and continue once the arm is back on track.
+Further method work should use a principled optimizer or MPC-style phase formulation on a new branch, rather than more threshold patches.
 
 ## Module Structure
 
 ```text
-MT3_dynamic_alignment/
-├── dynamic_alignment/          Core implementation
-│   ├── types.py                Shared data structures
-│   ├── motion_models.py        Constant-velocity and coordinated-turn models
-│   ├── kalman.py               Kalman / EKF filter
-│   ├── pose_estimator.py       Point cloud to object motion observation
-│   └── tracker.py              Main tracking and target-pose interface
-│
-├── examples/
-│   └── simulate_and_plot.py    Minimal synthetic simulation example
-│
-├── simulation/                 PyBullet experiments
-│   ├── 02_tracker_sim.py
-│   ├── 03_closed_loop.py
-│   ├── 04_baseline_comparison.py
-│   ├── 05_mt3_integration.py
-│   ├── 06_speed_sensitivity.py
-│   ├── 07_motion_type_comparison.py
-│   ├── 08_method_comparison.py
-│   ├── 09_robustness_analysis.py
-│   ├── 10_grasping_experiment.py
-│   └── results/
-│       ├── plot/               Figures and demo GIFs
-│       └── raw/                Raw experiment CSV files
-│
-├── tests/                      Hardware-free unit tests
-├── MT3_dynamic_alignment_notes.md
-└── 2511.10110v1.pdf            MT3 paper
+dynamic_alignment/             Core tracking and replay modules
+simulation/                    PyBullet experiments and logged runners
+simulation/run_experiment.py   Reproducible experiment runner
+simulation/results/            Canonical baseline and consolidated summaries
+tests/                         Hardware-free unit tests
 ```
 
 ## Quick Start
 
-Create the environment:
+Create a CPU-only environment:
 
 ```bash
 conda create -n dynamic_mt3 python=3.11 numpy matplotlib pytest -y
 conda activate dynamic_mt3
 ```
 
-Run the test suite:
+Install PyBullet-related packages if running simulations:
 
 ```bash
-python -m pytest tests/ -v
+conda install -c conda-forge pybullet pillow imageio -y
 ```
 
-Run the minimal simulation example:
+Run tests:
 
 ```bash
-python examples/simulate_and_plot.py
+python -m pytest tests/ -q
 ```
 
-PyBullet experiments require `pybullet`, `pillow`, and `imageio` in the same environment.
+Run the official/default smoke conditions:
 
-## Integration with MT3
-
-Real deployment requires replacing only two perception stubs and swapping the target-pose source in the controller.
-
-```python
-# 1. Replace hardware stubs in pose_estimator.py
-PoseEstimator.get_point_cloud_from_realsense()   # RealSense SDK
-PoseEstimator.segment_object_by_bbox()           # MT3 point-cloud segmentation
-
-# 2. Initialize once after MT3/GICP alignment completes
-tracker.init(current_cloud, initial_theta=gicp_theta, timestamp=t0)
-
-# 3. Use dynamic target poses in the control loop
-state = tracker.update(current_cloud, timestamp=t)
-T_target = tracker.get_target_pose(demo_data, t_demo=phase_time, tau=0.1)
+```bash
+python -m simulation.run_experiment \
+  --conditions static_replay dynamic_tau0 dynamic_cv dynamic_ct \
+  --speeds 2.0 \
+  --trials 1 \
+  --seed 42
 ```
 
-The rest of the MT3 demo data format can remain unchanged: `DemoData` stores the original end-effector pose sequence and timestamps.
+Failed exploratory methods require an explicit flag:
 
-## Design Notes
+```bash
+python -m simulation.run_experiment \
+  --include-experimental-methods \
+  --conditions feasibility_aware_replay_v2 \
+  --speeds 4.0 \
+  --trials 1
+```
 
-See [`MT3_dynamic_alignment_notes.md`](MT3_dynamic_alignment_notes.md) for the derivation, latency compensation analysis, motion-model assumptions, and two-phase replay design.
+## Integration Notes
+
+The code contains interfaces inspired by an eventual real-system setup, including point-cloud pose estimation and latency prediction. Those interfaces are not validated here with a real robot or RealSense camera.
+
+Any future hardware claim would require separate real-world experiments with explicitly logged perception, control, latency, contact, and failure metrics.
 
 ## Acknowledgments
 
-This project extends the ideas in MT3 (*Multi-Task Trajectory Transfer*, Science Robotics 2025) from static one-time alignment to continuous object-relative replay.
+This project explores object-relative replay ideas related to MT3-style demonstration transfer. The current repository should be read as a simulation baseline and negative-results exploration, not as a validated robot manipulation system.

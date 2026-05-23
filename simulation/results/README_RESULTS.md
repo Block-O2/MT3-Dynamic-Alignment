@@ -45,6 +45,8 @@ dynamic_tau0
 - keep as diagnostics: latency utilities and attempt/frame diagnostics
 - mark as experimental/not recommended: contact gates, close retiming, phase servo, and feasibility-aware replay variants
 
+The default/recommended runner conditions are `static_replay`, `dynamic_tau0`, `dynamic_cv`, and `dynamic_ct`. Failed exploratory methods require an explicit experimental flag and should not be presented as successful methods.
+
 ## Intermediate Runs
 
 `experiments/` is scratch/intermediate output and should not be committed.

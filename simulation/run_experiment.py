@@ -30,6 +30,15 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "simulation" / "results" / "experiments"
+OFFICIAL_CONDITIONS = ("static_replay", "dynamic_tau0", "dynamic_cv", "dynamic_ct")
+EXPERIMENTAL_CONDITIONS = (
+    "dynamic_tau0_contact_gated",
+    "dynamic_tau0_preclose_gated",
+    "dynamic_tau0_close_retimed",
+    "dynamic_phase_servo",
+    "feasibility_aware_replay",
+    "feasibility_aware_replay_v2",
+)
 
 AVAILABLE_CONDITIONS = {
     "static_replay": {
@@ -50,7 +59,7 @@ AVAILABLE_CONDITIONS = {
         "available": True,
         "contact_gate_enabled": True,
         "contact_gate_mode": "legacy",
-        "description": "dynamic_tau0 with pre-close contact-aware temporal gate.",
+        "description": "EXPERIMENTAL / NOT RECOMMENDED: dynamic_tau0 with pre-close contact-aware temporal gate.",
     },
     "dynamic_tau0_preclose_gated": {
         "replay_mode": "dynamic_tau0",
@@ -58,28 +67,28 @@ AVAILABLE_CONDITIONS = {
         "available": True,
         "contact_gate_enabled": True,
         "contact_gate_mode": "preclose",
-        "description": "dynamic_tau0 with PRE_CLOSE_ALIGN target hold before gripper closing.",
+        "description": "EXPERIMENTAL / NOT RECOMMENDED: dynamic_tau0 with PRE_CLOSE_ALIGN target hold before gripper closing.",
     },
     "dynamic_tau0_close_retimed": {
         "replay_mode": "dynamic_tau0",
         "tau": 0.0,
         "available": True,
         "close_retime_enabled": True,
-        "description": "dynamic_tau0 with event-triggered gripper close retiming inside a limited close window.",
+        "description": "EXPERIMENTAL / NOT RECOMMENDED: dynamic_tau0 with event-triggered gripper close retiming inside a limited close window.",
     },
     "dynamic_phase_servo": {
         "replay_mode": "dynamic_tau0",
         "tau": 0.0,
         "available": True,
         "phase_servo_enabled": True,
-        "description": "Experimental object-relative phase-aware servo controller built on dynamic_tau0 tracking.",
+        "description": "EXPERIMENTAL / NOT RECOMMENDED: object-relative phase-aware servo controller built on dynamic_tau0 tracking.",
     },
     "feasibility_aware_replay": {
         "replay_mode": "dynamic_tau0",
         "tau": 0.0,
         "available": True,
         "feasibility_aware_enabled": True,
-        "description": "MT3-aligned object-frame replay with adaptive demo phase progression.",
+        "description": "EXPERIMENTAL / NOT RECOMMENDED: MT3-aligned object-frame replay with adaptive demo phase progression.",
     },
     "feasibility_aware_replay_v2": {
         "replay_mode": "dynamic_tau0",
@@ -87,7 +96,7 @@ AVAILABLE_CONDITIONS = {
         "available": True,
         "feasibility_aware_enabled": True,
         "feasibility_aware_v2_enabled": True,
-        "description": "MT3-aligned feasibility-aware replay with progress pressure and emergency-only freeze.",
+        "description": "EXPERIMENTAL / NOT RECOMMENDED: MT3-aligned feasibility-aware replay with progress pressure and emergency-only freeze.",
     },
     "dynamic_cv": {
         "replay_mode": "dynamic_cv",
@@ -144,8 +153,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--conditions",
         nargs="+",
-        default=["static_replay", "dynamic_tau0", "dynamic_cv"],
-        choices=sorted(AVAILABLE_CONDITIONS),
+        default=list(OFFICIAL_CONDITIONS),
+        metavar="CONDITION",
+        help=(
+            "Conditions to run. Official conditions are: "
+            f"{', '.join(OFFICIAL_CONDITIONS)}. "
+            "Failed exploratory variants require --include-experimental-methods."
+        ),
+    )
+    parser.add_argument(
+        "--include-experimental-methods",
+        action="store_true",
+        help=(
+            "Allow failed exploratory conditions such as contact gates, close retiming, "
+            "phase servo, and feasibility-aware replay. These are retained for transparency "
+            "and are not recommended methods."
+        ),
     )
     parser.add_argument("--speeds", nargs="+", type=float, default=[2.0])
     parser.add_argument("--trials", type=int, default=1)
@@ -204,6 +227,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_conditions(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    unknown = [condition for condition in args.conditions if condition not in AVAILABLE_CONDITIONS]
+    if unknown:
+        parser.error(
+            "unknown condition(s): "
+            + ", ".join(unknown)
+            + ". Official conditions: "
+            + ", ".join(OFFICIAL_CONDITIONS)
+            + ". Experimental conditions require --include-experimental-methods."
+        )
+    experimental_requested = [
+        condition for condition in args.conditions if condition in EXPERIMENTAL_CONDITIONS
+    ]
+    if experimental_requested and not args.include_experimental_methods:
+        parser.error(
+            "experimental/not-recommended condition(s) requested without "
+            "--include-experimental-methods: "
+            + ", ".join(experimental_requested)
+        )
+
+
 def timestamped_output_dir(root: Path, stage_name: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_stage = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stage_name)
@@ -248,6 +292,9 @@ def config_from_args(args: argparse.Namespace, grasp, trial_specs: list[dict] | 
     return {
         "stage_name": args.stage_name,
         "conditions": args.conditions,
+        "official_conditions": list(OFFICIAL_CONDITIONS),
+        "experimental_conditions": list(EXPERIMENTAL_CONDITIONS),
+        "include_experimental_methods": bool(args.include_experimental_methods),
         "generated_trial_conditions": trial_specs or [],
         "condition_definitions": {name: AVAILABLE_CONDITIONS[name] for name in args.conditions},
         "speeds_cm_s": args.speeds,
@@ -1920,6 +1967,7 @@ def combine_attempt_diagnostics(attempt_diagnostics_dir: Path, output_path: Path
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    validate_conditions(args, parser)
     if args.trials <= 0:
         parser.error("--trials must be positive")
     if not args.speeds:

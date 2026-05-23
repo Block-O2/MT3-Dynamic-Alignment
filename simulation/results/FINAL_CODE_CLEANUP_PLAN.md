@@ -135,14 +135,18 @@ Reason:
 - It did not recover the 2/4 cm/s baseline.
 - Final demo progress barely improved.
 
-## Recommended CLI Cleanup
+## CLI Cleanup
 
-In a future approved code cleanup stage:
+The runner should keep official/default conditions focused on:
 
-- Keep default visible conditions focused on `static_replay`, `dynamic_tau0`, `dynamic_cv`, and optionally `dynamic_ct`.
-- Move failed method variants behind an explicit experimental flag or document them as deprecated experimental conditions.
-- Keep diagnostics options because they support reproducibility and failure analysis.
-- Do not delete canonical formal baseline data.
+- `static_replay`
+- `dynamic_tau0`
+- `dynamic_cv`
+- `dynamic_ct`
+
+Failed method variants should require an explicit experimental flag and should be labeled as experimental / not recommended. Diagnostics options should remain available because they support reproducibility and failure analysis.
+
+Do not delete canonical formal baseline data.
 
 ## Current Recommended Method
 
