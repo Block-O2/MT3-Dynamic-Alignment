@@ -135,6 +135,17 @@ PHASE_APPROACH_TIMEOUT_S = 4.0
 PHASE_PREGRASP_TIMEOUT_S = 3.0
 PHASE_CLOSE_TIMEOUT_S = 1.5
 PHASE_VERIFY_ATTACH_TIMEOUT_S = 1.0
+FEASIBILITY_MAX_TARGET_STEP_MM = 8.0
+FEASIBILITY_MAX_TARGET_VELOCITY_MM_S = 120.0
+FEASIBILITY_MAX_EE_TO_TARGET_ERROR_MM = 35.0
+FEASIBILITY_FREEZE_IF_ERROR_ABOVE_MM = 50.0
+FEASIBILITY_MIN_PROGRESS_RATE = 0.0
+FEASIBILITY_MAX_PROGRESS_RATE = 1.0
+FEASIBILITY_MIN_NORMAL_PROGRESS_RATE = 0.25
+FEASIBILITY_EMERGENCY_FREEZE_ERROR_MM = 80.0
+FEASIBILITY_PROGRESS_LAG_SLOW_THRESHOLD = 0.15
+FEASIBILITY_PROGRESS_LAG_CATCHUP_THRESHOLD = 0.25
+FEASIBILITY_ERROR_TREND_WINDOW_S = 0.3
 
 
 class GraspDemo(NamedTuple):
@@ -207,6 +218,24 @@ class TrialResult(NamedTuple):
     phase_close_trigger_ee_to_object_mm: float = float("nan")
     attach_verified: bool = False
     phase_timeout: bool = False
+    feasibility_aware_enabled: bool = False
+    mean_phase_rate: float = float("nan")
+    min_phase_rate: float = float("nan")
+    max_phase_rate: float = float("nan")
+    n_phase_freeze_frames: int = 0
+    n_phase_slowdown_frames: int = 0
+    n_progress_pressure_frames: int = 0
+    n_catchup_frames: int = 0
+    mean_progress_lag: float = float("nan")
+    max_progress_lag: float = float("nan")
+    n_emergency_freeze_frames: int = 0
+    dominant_feasibility_fail_reason: str = "disabled"
+    mean_target_velocity_mm_s: float = float("nan")
+    max_target_velocity_mm_s: float = float("nan")
+    mean_feasibility_ee_to_target_error_mm: float = float("nan")
+    max_feasibility_ee_to_target_error_mm: float = float("nan")
+    final_demo_progress_pct: float = float("nan")
+    phase_progress_failure_reason: str = "disabled"
 
 
 def moving_box_position(t: float, speed_cm_s: float) -> np.ndarray:
@@ -650,6 +679,19 @@ def run_trial(
     pregrasp_timeout_s: float = PHASE_PREGRASP_TIMEOUT_S,
     close_timeout_s: float = PHASE_CLOSE_TIMEOUT_S,
     verify_attach_timeout_s: float = PHASE_VERIFY_ATTACH_TIMEOUT_S,
+    feasibility_aware_enabled: bool = False,
+    max_target_step_mm: float = FEASIBILITY_MAX_TARGET_STEP_MM,
+    max_target_velocity_mm_s: float = FEASIBILITY_MAX_TARGET_VELOCITY_MM_S,
+    max_ee_to_target_error_mm: float = FEASIBILITY_MAX_EE_TO_TARGET_ERROR_MM,
+    freeze_if_error_above_mm: float = FEASIBILITY_FREEZE_IF_ERROR_ABOVE_MM,
+    min_progress_rate: float = FEASIBILITY_MIN_PROGRESS_RATE,
+    max_progress_rate: float = FEASIBILITY_MAX_PROGRESS_RATE,
+    feasibility_aware_v2_enabled: bool = False,
+    min_normal_progress_rate: float = FEASIBILITY_MIN_NORMAL_PROGRESS_RATE,
+    emergency_freeze_error_mm: float = FEASIBILITY_EMERGENCY_FREEZE_ERROR_MM,
+    progress_lag_slow_threshold: float = FEASIBILITY_PROGRESS_LAG_SLOW_THRESHOLD,
+    progress_lag_catchup_threshold: float = FEASIBILITY_PROGRESS_LAG_CATCHUP_THRESHOLD,
+    error_trend_window_s: float = FEASIBILITY_ERROR_TREND_WINDOW_S,
     diagnostics_path: Path | None = None,
     attempt_diagnostics_path: Path | None = None,
     condition_label: str | None = None,
@@ -679,6 +721,12 @@ def run_trial(
         verify_attach_timeout_s,
     ) < 0:
         raise ValueError("phase-servo thresholds and timeouts must be non-negative")
+    if min(max_target_step_mm, max_target_velocity_mm_s, max_ee_to_target_error_mm, freeze_if_error_above_mm) < 0:
+        raise ValueError("feasibility-aware thresholds must be non-negative")
+    if min_progress_rate < 0 or max_progress_rate < min_progress_rate:
+        raise ValueError("feasibility-aware progress rate bounds are invalid")
+    if min(min_normal_progress_rate, emergency_freeze_error_mm, progress_lag_slow_threshold, progress_lag_catchup_threshold, error_trend_window_s) < 0:
+        raise ValueError("feasibility-aware v2 parameters must be non-negative")
 
     client_id = p.connect(p.GUI if USE_GUI else p.DIRECT)
     if client_id < 0:
@@ -784,6 +832,28 @@ def run_trial(
         phase_close_trigger_ee_to_object_mm = float("nan")
         attach_verified = False
         phase_lift_start_sim_t = float("nan")
+        feasibility_phase_rates: list[float] = []
+        feasibility_target_velocities_mm_s: list[float] = []
+        feasibility_ee_to_target_errors_mm: list[float] = []
+        feasibility_progress_lag_values: list[float] = []
+        feasibility_fail_reasons: list[str] = []
+        feasibility_error_history: list[tuple[float, float]] = []
+        feasibility_fail_reason = "disabled" if not feasibility_aware_enabled else "not_started"
+        feasibility_passed = not feasibility_aware_enabled
+        chosen_candidate_rate = 1.0
+        chosen_target_velocity_mm_s = float("nan")
+        chosen_ee_to_target_error_mm = float("nan")
+        expected_demo_progress = 0.0
+        progress_lag = 0.0
+        error_trend_mm_s = 0.0
+        progress_pressure_active = False
+        catchup_active = False
+        emergency_freeze_active = False
+        n_phase_freeze_frames = 0
+        n_phase_slowdown_frames = 0
+        n_progress_pressure_frames = 0
+        n_catchup_frames = 0
+        n_emergency_freeze_frames = 0
         diagnostic_rows: list[dict[str, object]] = []
         attempt_diagnostic_rows: list[dict[str, object]] = []
         aborted_by_attempt_limit = False
@@ -856,7 +926,150 @@ def run_trial(
                                 float(np.linalg.norm(estimated_delta_xy - true_delta_xy) * 1000.0),
                             )
                         )
-                    if phase_servo_enabled:
+                    if feasibility_aware_enabled:
+                        current_s = float(demo_clock[0])
+                        current_pose = tracker.get_target_pose(demo.poses, t_demo=current_s, tau=0.0)
+                        current_target = np.asarray(current_pose[:3, 3], dtype=float)
+                        current_error_mm = float(
+                            np.linalg.norm((ee_pos_before_command - current_target)[:2]) * 1000.0
+                        )
+                        expected_demo_progress = min(replay_t, demo.poses.duration)
+                        progress_lag = max(0.0, expected_demo_progress - current_s)
+                        feasibility_error_history.append((replay_t, current_error_mm))
+                        feasibility_error_history = [
+                            item for item in feasibility_error_history
+                            if replay_t - item[0] <= error_trend_window_s
+                        ]
+                        if len(feasibility_error_history) >= 2:
+                            oldest_t, oldest_error = feasibility_error_history[0]
+                            dt_error = replay_t - oldest_t
+                            error_trend_mm_s = (
+                                (current_error_mm - oldest_error) / dt_error
+                                if dt_error > 0.0
+                                else 0.0
+                            )
+                        else:
+                            error_trend_mm_s = 0.0
+                        progress_pressure_active = feasibility_aware_v2_enabled and progress_lag > progress_lag_slow_threshold
+                        catchup_active = feasibility_aware_v2_enabled and progress_lag > progress_lag_catchup_threshold
+                        emergency_freeze_active = feasibility_aware_v2_enabled and (
+                            (not np.isfinite(current_error_mm))
+                            or current_error_mm > emergency_freeze_error_mm
+                        )
+                        if feasibility_aware_v2_enabled:
+                            min_allowed_rate = 0.5 if catchup_active else min_normal_progress_rate
+                            candidate_rates = [
+                                rate
+                                for rate in (1.0, 0.5, 0.25)
+                                if max(min_progress_rate, min_allowed_rate) <= rate <= max_progress_rate
+                            ]
+                            if emergency_freeze_active:
+                                candidate_rates.append(0.0)
+                        else:
+                            candidate_rates = [
+                                rate
+                                for rate in (1.0, 0.5, 0.25, 0.0)
+                                if min_progress_rate <= rate <= max_progress_rate
+                            ]
+                            if 0.0 not in candidate_rates:
+                                candidate_rates.append(0.0)
+                        selected_rate = 0.0
+                        selected_pose = current_pose
+                        selected_velocity_mm_s = 0.0
+                        selected_error_mm = current_error_mm
+                        feasibility_passed = False
+                        feasibility_fail_reason = "freeze_error"
+                        if feasibility_aware_v2_enabled or current_error_mm <= freeze_if_error_above_mm:
+                            feasibility_fail_reason = "no_candidate"
+                            for candidate_rate in candidate_rates:
+                                next_s = min(
+                                    current_s + candidate_rate * sim03.DT,
+                                    demo.poses.duration,
+                                )
+                                candidate_pose = tracker.get_target_pose(
+                                    demo.poses,
+                                    t_demo=next_s,
+                                    tau=0.0,
+                                )
+                                candidate_target = np.asarray(candidate_pose[:3, 3], dtype=float)
+                                target_step_mm = float(
+                                    np.linalg.norm((candidate_target - current_target)[:3]) * 1000.0
+                                )
+                                target_velocity_mm_s = target_step_mm / sim03.DT
+                                ee_to_candidate_mm = float(
+                                    np.linalg.norm((ee_pos_before_command - candidate_target)[:2]) * 1000.0
+                                )
+                                if (
+                                    target_step_mm <= max_target_step_mm
+                                    and target_velocity_mm_s <= max_target_velocity_mm_s
+                                    and (
+                                        ee_to_candidate_mm <= max_ee_to_target_error_mm
+                                        or (
+                                            feasibility_aware_v2_enabled
+                                            and current_error_mm > max_ee_to_target_error_mm
+                                            and error_trend_mm_s < 0.0
+                                            and candidate_rate <= 0.5
+                                            and not emergency_freeze_active
+                                        )
+                                    )
+                                ):
+                                    selected_rate = candidate_rate
+                                    selected_pose = candidate_pose
+                                    selected_velocity_mm_s = target_velocity_mm_s
+                                    selected_error_mm = ee_to_candidate_mm
+                                    feasibility_passed = True
+                                    feasibility_fail_reason = "none"
+                                    break
+                        if not feasibility_passed:
+                            if feasibility_aware_v2_enabled and not emergency_freeze_active:
+                                selected_rate = max(
+                                    min_normal_progress_rate,
+                                    0.5 if catchup_active else min_normal_progress_rate,
+                                )
+                                selected_rate = min(selected_rate, max_progress_rate)
+                                next_s = min(current_s + selected_rate * sim03.DT, demo.poses.duration)
+                                selected_pose = tracker.get_target_pose(demo.poses, t_demo=next_s, tau=0.0)
+                                selected_target = np.asarray(selected_pose[:3, 3], dtype=float)
+                                selected_velocity_mm_s = float(
+                                    np.linalg.norm((selected_target - current_target)[:3])
+                                    * 1000.0
+                                    / sim03.DT
+                                )
+                                selected_error_mm = float(
+                                    np.linalg.norm((ee_pos_before_command - selected_target)[:2])
+                                    * 1000.0
+                                )
+                                feasibility_fail_reason = "forced_progress"
+                            else:
+                                selected_rate = 0.0
+                                selected_pose = current_pose
+                                selected_velocity_mm_s = 0.0
+                                selected_error_mm = current_error_mm
+                                if emergency_freeze_active:
+                                    feasibility_fail_reason = "emergency_freeze"
+                        demo_clock[0] = min(current_s + selected_rate * sim03.DT, demo.poses.duration)
+                        target_pose = selected_pose
+                        lateral_error_mm = selected_error_mm
+                        frame_progress_rate = selected_rate
+                        chosen_candidate_rate = selected_rate
+                        chosen_target_velocity_mm_s = selected_velocity_mm_s
+                        chosen_ee_to_target_error_mm = selected_error_mm
+                        feasibility_phase_rates.append(selected_rate)
+                        feasibility_target_velocities_mm_s.append(selected_velocity_mm_s)
+                        feasibility_ee_to_target_errors_mm.append(selected_error_mm)
+                        feasibility_progress_lag_values.append(progress_lag)
+                        feasibility_fail_reasons.append(feasibility_fail_reason)
+                        if selected_rate <= 0.0:
+                            n_phase_freeze_frames += 1
+                            if emergency_freeze_active:
+                                n_emergency_freeze_frames += 1
+                        elif selected_rate < max_progress_rate:
+                            n_phase_slowdown_frames += 1
+                        if progress_pressure_active:
+                            n_progress_pressure_frames += 1
+                        if catchup_active:
+                            n_catchup_frames += 1
+                    elif phase_servo_enabled:
                         phase_elapsed_s = replay_t - phase_start_sim_t
                         pregrasp_t_demo = max(0.0, DEMO_APPROACH_DURATION - sim03.DT)
                         approach_t_demo = max(0.0, DEMO_APPROACH_DURATION * 0.6)
@@ -1395,6 +1608,21 @@ def run_trial(
                         "phase_controller_enabled": int(phase_servo_enabled),
                         "phase_close_triggered": int(phase_close_triggered),
                         "attach_verified": int(attach_verified),
+                        "feasibility_aware_enabled": int(feasibility_aware_enabled),
+                        "s_demo": demo_clock[0],
+                        "s_dot": chosen_candidate_rate,
+                        "chosen_candidate_rate": chosen_candidate_rate,
+                        "target_velocity_mm_s": chosen_target_velocity_mm_s,
+                        "ee_to_target_error_mm": chosen_ee_to_target_error_mm,
+                        "feasibility_passed": int(feasibility_passed),
+                        "feasibility_fail_reason": feasibility_fail_reason,
+                        "expected_demo_progress": expected_demo_progress,
+                        "progress_lag": progress_lag,
+                        "error_trend_mm_s": error_trend_mm_s,
+                        "selected_rate": chosen_candidate_rate,
+                        "progress_pressure_active": int(progress_pressure_active),
+                        "catchup_active": int(catchup_active),
+                        "emergency_freeze_active": int(emergency_freeze_active),
                     }
                 )
 
@@ -1500,6 +1728,21 @@ def run_trial(
             "phase_controller_enabled",
             "phase_close_triggered",
             "attach_verified",
+            "feasibility_aware_enabled",
+            "s_demo",
+            "s_dot",
+            "chosen_candidate_rate",
+            "target_velocity_mm_s",
+            "ee_to_target_error_mm",
+            "feasibility_passed",
+            "feasibility_fail_reason",
+            "expected_demo_progress",
+            "progress_lag",
+            "error_trend_mm_s",
+            "selected_rate",
+            "progress_pressure_active",
+            "catchup_active",
+            "emergency_freeze_active",
         ]
         with diagnostics_path.open("w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -1523,6 +1766,30 @@ def run_trial(
             phase_failure_reason = "approach_failed"
         else:
             phase_failure_reason = "unknown"
+    phase_rate_values = np.asarray(feasibility_phase_rates, dtype=float)
+    target_velocity_values = np.asarray(feasibility_target_velocities_mm_s, dtype=float)
+    feasibility_error_values = np.asarray(feasibility_ee_to_target_errors_mm, dtype=float)
+    progress_lag_values = np.asarray(feasibility_progress_lag_values, dtype=float)
+    dominant_feasibility_fail_reason = "disabled"
+    if feasibility_aware_enabled and feasibility_fail_reasons:
+        reason_counts: dict[str, int] = {}
+        for reason in feasibility_fail_reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        dominant_feasibility_fail_reason = max(
+            reason_counts.items(),
+            key=lambda item: item[1],
+        )[0]
+    phase_progress_failure_reason = "disabled"
+    if feasibility_aware_enabled:
+        final_progress_pct_for_reason = float(100.0 * demo_clock[0] / demo.poses.duration) if demo.poses.duration > 0 else float("nan")
+        if success:
+            phase_progress_failure_reason = "none"
+        elif n_phase_freeze_frames > 0 and feasibility_fail_reason != "none":
+            phase_progress_failure_reason = feasibility_fail_reason
+        elif np.isfinite(final_progress_pct_for_reason) and final_progress_pct_for_reason < 95.0:
+            phase_progress_failure_reason = "incomplete_progress"
+        else:
+            phase_progress_failure_reason = "skill_not_completed"
     main_failure_for_attempts = "none"
     if not success:
         if phase_servo_enabled and phase_timeout:
@@ -1698,6 +1965,24 @@ def run_trial(
         phase_close_trigger_ee_to_object_mm=phase_close_trigger_ee_to_object_mm,
         attach_verified=attach_verified,
         phase_timeout=phase_timeout,
+        feasibility_aware_enabled=feasibility_aware_enabled,
+        mean_phase_rate=float(np.mean(phase_rate_values)) if phase_rate_values.size else float("nan"),
+        min_phase_rate=float(np.min(phase_rate_values)) if phase_rate_values.size else float("nan"),
+        max_phase_rate=float(np.max(phase_rate_values)) if phase_rate_values.size else float("nan"),
+        n_phase_freeze_frames=n_phase_freeze_frames,
+        n_phase_slowdown_frames=n_phase_slowdown_frames,
+        n_progress_pressure_frames=n_progress_pressure_frames,
+        n_catchup_frames=n_catchup_frames,
+        mean_progress_lag=float(np.mean(progress_lag_values)) if progress_lag_values.size else float("nan"),
+        max_progress_lag=float(np.max(progress_lag_values)) if progress_lag_values.size else float("nan"),
+        n_emergency_freeze_frames=n_emergency_freeze_frames,
+        dominant_feasibility_fail_reason=dominant_feasibility_fail_reason,
+        mean_target_velocity_mm_s=float(np.mean(target_velocity_values)) if target_velocity_values.size else float("nan"),
+        max_target_velocity_mm_s=float(np.max(target_velocity_values)) if target_velocity_values.size else float("nan"),
+        mean_feasibility_ee_to_target_error_mm=float(np.mean(feasibility_error_values)) if feasibility_error_values.size else float("nan"),
+        max_feasibility_ee_to_target_error_mm=float(np.max(feasibility_error_values)) if feasibility_error_values.size else float("nan"),
+        final_demo_progress_pct=float(100.0 * demo_clock[0] / demo.poses.duration) if demo.poses.duration > 0 else float("nan"),
+        phase_progress_failure_reason=phase_progress_failure_reason,
     )
 
 

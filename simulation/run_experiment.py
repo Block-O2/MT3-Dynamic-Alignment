@@ -74,6 +74,21 @@ AVAILABLE_CONDITIONS = {
         "phase_servo_enabled": True,
         "description": "Experimental object-relative phase-aware servo controller built on dynamic_tau0 tracking.",
     },
+    "feasibility_aware_replay": {
+        "replay_mode": "dynamic_tau0",
+        "tau": 0.0,
+        "available": True,
+        "feasibility_aware_enabled": True,
+        "description": "MT3-aligned object-frame replay with adaptive demo phase progression.",
+    },
+    "feasibility_aware_replay_v2": {
+        "replay_mode": "dynamic_tau0",
+        "tau": 0.0,
+        "available": True,
+        "feasibility_aware_enabled": True,
+        "feasibility_aware_v2_enabled": True,
+        "description": "MT3-aligned feasibility-aware replay with progress pressure and emergency-only freeze.",
+    },
     "dynamic_cv": {
         "replay_mode": "dynamic_cv",
         "tau": 0.1,
@@ -156,6 +171,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pregrasp-timeout-s", type=float, default=3.0)
     parser.add_argument("--close-timeout-s", type=float, default=1.5)
     parser.add_argument("--verify-attach-timeout-s", type=float, default=1.0)
+    parser.add_argument("--max-target-step-mm", type=float, default=8.0)
+    parser.add_argument("--max-target-velocity-mm-s", type=float, default=120.0)
+    parser.add_argument("--max-ee-to-target-error-mm", type=float, default=35.0)
+    parser.add_argument("--freeze-if-error-above-mm", type=float, default=50.0)
+    parser.add_argument("--min-progress-rate", type=float, default=0.0)
+    parser.add_argument("--max-progress-rate", type=float, default=1.0)
+    parser.add_argument("--min-normal-progress-rate", type=float, default=0.25)
+    parser.add_argument("--emergency-freeze-error-mm", type=float, default=80.0)
+    parser.add_argument("--progress-lag-slow-threshold", type=float, default=0.15)
+    parser.add_argument("--progress-lag-catchup-threshold", type=float, default=0.25)
+    parser.add_argument("--error-trend-window-s", type=float, default=0.3)
     parser.add_argument(
         "--latency-validation",
         action="store_true",
@@ -251,6 +277,21 @@ def config_from_args(args: argparse.Namespace, grasp, trial_specs: list[dict] | 
             "close_timeout_s": args.close_timeout_s,
             "verify_attach_timeout_s": args.verify_attach_timeout_s,
             "note": "Stage 6A conservative smoke defaults; not tuned for success.",
+        },
+        "feasibility_aware_defaults": {
+            "max_target_step_mm": args.max_target_step_mm,
+            "max_target_velocity_mm_s": args.max_target_velocity_mm_s,
+            "max_ee_to_target_error_mm": args.max_ee_to_target_error_mm,
+            "freeze_if_error_above_mm": args.freeze_if_error_above_mm,
+            "min_progress_rate": args.min_progress_rate,
+            "max_progress_rate": args.max_progress_rate,
+            "min_normal_progress_rate": args.min_normal_progress_rate,
+            "emergency_freeze_error_mm": args.emergency_freeze_error_mm,
+            "progress_lag_slow_threshold": args.progress_lag_slow_threshold,
+            "progress_lag_catchup_threshold": args.progress_lag_catchup_threshold,
+            "error_trend_window_s": args.error_trend_window_s,
+            "candidate_phase_rates": [1.0, 0.5, 0.25, 0.0],
+            "note": "Stage 7B/7B.1 conservative smoke defaults; not tuned for success.",
         },
         "latency_validation": bool(args.latency_validation),
         "observation_delay_ms": args.observation_delay_ms,
@@ -349,6 +390,24 @@ RAW_FIELDS = [
     "phase_close_trigger_ee_to_object_mm",
     "attach_verified",
     "phase_timeout",
+    "feasibility_aware_enabled",
+    "mean_phase_rate",
+    "min_phase_rate",
+    "max_phase_rate",
+    "n_phase_freeze_frames",
+    "n_phase_slowdown_frames",
+    "n_progress_pressure_frames",
+    "n_catchup_frames",
+    "mean_progress_lag",
+    "max_progress_lag",
+    "n_emergency_freeze_frames",
+    "dominant_feasibility_fail_reason",
+    "mean_target_velocity_mm_s",
+    "max_target_velocity_mm_s",
+    "mean_feasibility_ee_to_target_error_mm",
+    "max_feasibility_ee_to_target_error_mm",
+    "final_demo_progress_pct",
+    "phase_progress_failure_reason",
     "contact_position_error_mm",
     "orientation_error_deg",
     "approach_error_mm",
@@ -421,6 +480,16 @@ def append_raw_row(path: Path, row: dict) -> None:
         "phase_close_trigger_sim_t",
         "phase_close_trigger_ee_to_target_mm",
         "phase_close_trigger_ee_to_object_mm",
+        "mean_phase_rate",
+        "min_phase_rate",
+        "max_phase_rate",
+        "mean_progress_lag",
+        "max_progress_lag",
+        "mean_target_velocity_mm_s",
+        "max_target_velocity_mm_s",
+        "mean_feasibility_ee_to_target_error_mm",
+        "max_feasibility_ee_to_target_error_mm",
+        "final_demo_progress_pct",
         "contact_position_error_mm",
         "orientation_error_deg",
         "approach_error_mm",
@@ -439,6 +508,7 @@ def append_raw_row(path: Path, row: dict) -> None:
     serialized["close_triggered"] = int(bool(serialized["close_triggered"]))
     serialized["attach_verified"] = int(bool(serialized["attach_verified"]))
     serialized["phase_timeout"] = int(bool(serialized["phase_timeout"]))
+    serialized["feasibility_aware_enabled"] = int(bool(serialized["feasibility_aware_enabled"]))
     with path.open("a", newline="", encoding="utf-8") as file:
         csv.DictWriter(file, fieldnames=RAW_FIELDS).writerow(serialized)
 
@@ -471,6 +541,20 @@ def write_summary(path: Path, rows: list[dict]) -> None:
         "close_retime_trigger_rate",
         "phase_close_trigger_rate",
         "attach_verified_rate",
+        "mean_phase_rate",
+        "mean_final_demo_progress_pct",
+        "mean_n_phase_freeze_frames",
+        "mean_n_phase_slowdown_frames",
+        "mean_n_progress_pressure_frames",
+        "mean_n_catchup_frames",
+        "mean_progress_lag",
+        "max_progress_lag",
+        "mean_n_emergency_freeze_frames",
+        "mean_target_velocity_mm_s",
+        "max_target_velocity_mm_s",
+        "mean_feasibility_ee_to_target_error_mm",
+        "max_feasibility_ee_to_target_error_mm",
+        "dominant_feasibility_fail_reason_counts",
         "mean_lift_mm",
         "mean_progress_pct",
         "mean_contact_gate_wait_s",
@@ -522,6 +606,7 @@ def write_summary(path: Path, rows: list[dict]) -> None:
             gated_rows = [row for row in group if row.get("contact_gate_enabled", False)]
             retimed_rows = [row for row in group if row.get("close_retime_enabled", False)]
             phase_rows = [row for row in group if row.get("phase_controller_enabled", False)]
+            feasibility_rows = [row for row in group if row.get("feasibility_aware_enabled", False)]
             writer.writerow(
                 {
                     "condition": condition,
@@ -542,6 +627,28 @@ def write_summary(path: Path, rows: list[dict]) -> None:
                     "close_retime_trigger_rate": f"{np.mean([row.get('close_retime_triggered', False) for row in retimed_rows]):.3f}" if retimed_rows else "nan",
                     "phase_close_trigger_rate": f"{np.mean([row.get('close_triggered', False) for row in phase_rows]):.3f}" if phase_rows else "nan",
                     "attach_verified_rate": f"{np.mean([row.get('attach_verified', False) for row in phase_rows]):.3f}" if phase_rows else "nan",
+                    "mean_phase_rate": f"{finite_mean(row.get('mean_phase_rate', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_final_demo_progress_pct": f"{finite_mean(row.get('final_demo_progress_pct', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_n_phase_freeze_frames": f"{finite_mean(float(row.get('n_phase_freeze_frames', 0)) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_n_phase_slowdown_frames": f"{finite_mean(float(row.get('n_phase_slowdown_frames', 0)) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_n_progress_pressure_frames": f"{finite_mean(float(row.get('n_progress_pressure_frames', 0)) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_n_catchup_frames": f"{finite_mean(float(row.get('n_catchup_frames', 0)) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_progress_lag": f"{finite_mean(row.get('mean_progress_lag', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "max_progress_lag": f"{finite_mean(row.get('max_progress_lag', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_n_emergency_freeze_frames": f"{finite_mean(float(row.get('n_emergency_freeze_frames', 0)) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_target_velocity_mm_s": f"{finite_mean(row.get('mean_target_velocity_mm_s', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "max_target_velocity_mm_s": f"{finite_mean(row.get('max_target_velocity_mm_s', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "mean_feasibility_ee_to_target_error_mm": f"{finite_mean(row.get('mean_feasibility_ee_to_target_error_mm', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "max_feasibility_ee_to_target_error_mm": f"{finite_mean(row.get('max_feasibility_ee_to_target_error_mm', float('nan')) for row in feasibility_rows):.3f}" if feasibility_rows else "nan",
+                    "dominant_feasibility_fail_reason_counts": json.dumps(
+                        {
+                            str(reason): sum(row.get("dominant_feasibility_fail_reason", "disabled") == reason for row in feasibility_rows)
+                            for reason in sorted({row.get("dominant_feasibility_fail_reason", "disabled") for row in feasibility_rows})
+                        },
+                        sort_keys=True,
+                    )
+                    if feasibility_rows
+                    else "{}",
                     "mean_lift_mm": f"{np.mean([row['lift_mm'] for row in group]):.3f}",
                     "mean_progress_pct": f"{np.mean([row['progress_pct'] for row in group]):.3f}",
                     "mean_contact_gate_wait_s": f"{finite_mean(row.get('contact_gate_wait_s', float('nan')) for row in gated_rows):.3f}" if gated_rows else "nan",
@@ -614,6 +721,8 @@ def build_trial_specs(args: argparse.Namespace) -> tuple[list[dict], list[str]]:
                 "contact_gate_mode": info.get("contact_gate_mode", "legacy"),
                 "close_retime_enabled": bool(info.get("close_retime_enabled", False)),
                 "phase_servo_enabled": bool(info.get("phase_servo_enabled", False)),
+                "feasibility_aware_enabled": bool(info.get("feasibility_aware_enabled", False)),
+                "feasibility_aware_v2_enabled": bool(info.get("feasibility_aware_v2_enabled", False)),
                 "available": True,
                 "description": info["description"],
             }
@@ -626,11 +735,14 @@ def write_analysis(path: Path, args: argparse.Namespace, rows: list[dict], defer
     for row in rows:
         grouped.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
 
-    stage_description = (
-        "Stage 4A latency validation. The run injects artificial observation delay into tracker point-cloud observations while keeping the same robot, object trajectory, controller, thresholds, physics, retry logic, success criteria, and fixed-constraint behavior."
-        if args.latency_validation or "latency" in args.stage_name
-        else "Stage 3 baseline smoke test. The run keeps the same robot, object, trajectory, controller, thresholds, physics, and success criteria as the existing grasping experiment."
-    )
+    if args.latency_validation or "latency" in args.stage_name:
+        stage_description = "Stage 4A latency validation. The run injects artificial observation delay into tracker point-cloud observations while keeping the same robot, object trajectory, controller, thresholds, physics, retry logic, success criteria, and fixed-constraint behavior."
+    elif "stage7b1" in args.stage_name:
+        stage_description = "Stage 7B.1 feasibility-aware replay progress-fix smoke test. The run keeps the same robot, object trajectory, controller, thresholds, physics, retry logic, success criteria, and fixed-constraint behavior while comparing dynamic_tau0, feasibility_aware_replay, and feasibility_aware_replay_v2."
+    elif "stage7" in args.stage_name or "feasibility_aware" in args.stage_name:
+        stage_description = "Stage 7 feasibility-aware dynamic replay smoke test. The run keeps the same robot, object trajectory, controller, thresholds, physics, retry logic, success criteria, and fixed-constraint behavior."
+    else:
+        stage_description = "Stage 3 baseline smoke test. The run keeps the same robot, object, trajectory, controller, thresholds, physics, and success criteria as the existing grasping experiment."
     lines = [
         f"# {args.stage_name}",
         "",
@@ -702,6 +814,8 @@ def write_analysis(path: Path, args: argparse.Namespace, rows: list[dict], defer
         lines.extend(close_retiming_answers(rows))
     if "stage6" in args.stage_name or "phase_servo" in args.stage_name:
         lines.extend(phase_servo_answers(rows))
+    if "stage7" in args.stage_name or "feasibility_aware" in args.stage_name:
+        lines.extend(feasibility_aware_answers(rows))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1082,6 +1196,152 @@ def phase_servo_answers(rows: list[dict]) -> list[str]:
     ]
 
 
+def feasibility_aware_answers(rows: list[dict]) -> list[str]:
+    by_condition: dict[str, list[dict]] = {}
+    by_condition_speed: dict[tuple[str, float], list[dict]] = {}
+    for row in rows:
+        by_condition.setdefault(row["condition"], []).append(row)
+        by_condition_speed.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
+
+    def success_rate(group: list[dict]) -> float:
+        return float(np.mean([row["success"] for row in group])) if group else float("nan")
+
+    def no_contact(group: list[dict]) -> int:
+        return sum(not np.isfinite(row["contact_position_error_mm"]) for row in group)
+
+    def count_failure(group: list[dict], label: str) -> int:
+        return sum(row["main_failure"] == label for row in group)
+
+    base = by_condition.get("dynamic_tau0", [])
+    feasible_v1 = by_condition.get("feasibility_aware_replay", [])
+    feasible_v2 = by_condition.get("feasibility_aware_replay_v2", [])
+    if feasible_v2:
+        return feasibility_aware_v2_answers(rows)
+
+    feasible = feasible_v1
+    base_4 = by_condition_speed.get(("dynamic_tau0", 4.0), [])
+    feasible_4 = by_condition_speed.get(("feasibility_aware_replay", 4.0), [])
+    base_8 = by_condition_speed.get(("dynamic_tau0", 8.0), [])
+    feasible_8 = by_condition_speed.get(("feasibility_aware_replay", 8.0), [])
+    mean_phase_rate = finite_mean(row.get("mean_phase_rate", float("nan")) for row in feasible)
+    mean_progress = finite_mean(row.get("final_demo_progress_pct", float("nan")) for row in feasible)
+    freeze_frames = finite_mean(float(row.get("n_phase_freeze_frames", 0)) for row in feasible)
+    slowdown_frames = finite_mean(float(row.get("n_phase_slowdown_frames", 0)) for row in feasible)
+    progress_reasons: dict[str, int] = {}
+    for row in feasible:
+        reason = row.get("phase_progress_failure_reason", "unknown")
+        progress_reasons[reason] = progress_reasons.get(reason, 0) + 1
+
+    preserves_4 = bool(base_4 and feasible_4) and success_rate(feasible_4) >= success_rate(base_4)
+    improves_8 = bool(base_8 and feasible_8) and success_rate(feasible_8) > success_rate(base_8)
+    if preserves_4 and improves_8:
+        recommendation = "PROCEED_TO_FEASIBILITY_AWARE_FORMAL"
+    elif feasible and mean_progress < 80.0:
+        recommendation = "FIX_FEASIBILITY_LOGIC_FIRST"
+    elif feasible and success_rate(feasible) < success_rate(base):
+        recommendation = "FEASIBILITY_AWARE_NOT_PROMISING"
+    else:
+        recommendation = "ARCHITECTURE_TOO_UNSTABLE"
+
+    return [
+        "",
+        "## Stage 7B Feasibility-Aware Replay Questions",
+        "",
+        f"1. Does feasibility_aware_replay preserve the strong 4 cm/s dynamic_tau0 baseline? dynamic_tau0={success_rate(base_4):.3f}, feasibility_aware_replay={success_rate(feasible_4):.3f}.",
+        f"2. Does it improve 8 cm/s attempt_limit/no-contact failures? dynamic_tau0 8 cm/s success_rate={success_rate(base_8):.3f}, no_contact={no_contact(base_8)}, attempt_limit={count_failure(base_8, 'attempt_limit')}; feasibility_aware_replay 8 cm/s success_rate={success_rate(feasible_8):.3f}, no_contact={no_contact(feasible_8)}, attempt_limit={count_failure(feasible_8, 'attempt_limit')}.",
+        f"3. Does it slow or freeze demo progression too much? mean_phase_rate={mean_phase_rate:.3f}, mean_freeze_frames={freeze_frames:.3f}, mean_slowdown_frames={slowdown_frames:.3f}.",
+        f"4. Does final_demo_progress_pct remain high enough to complete the skill? mean_final_demo_progress_pct={mean_progress:.3f}; progress_failure_reasons={progress_reasons}.",
+        "5. Are gripper/close actions still consistent with demo phase s(t)? Yes by construction: gripper width is sampled from the original demo at the selected demo phase, not manually retimed by grasp-specific events.",
+        "6. Are failures more interpretable than dynamic_tau0? Partly: raw_results.csv and diagnostics expose phase rates, freezes, target velocity, and feasibility fail reasons.",
+        "7. Does this look like a general MT3-style replay improvement rather than a grasp-specific patch? Yes in formulation: it preserves T_delta(t) @ T_demo(s(t)) and controls only demo phase progression.",
+        f"8. Is it promising enough for a 10-trial formal comparison? Recommendation: {recommendation}.",
+        "",
+        recommendation,
+    ]
+
+
+def feasibility_aware_v2_answers(rows: list[dict]) -> list[str]:
+    by_condition: dict[str, list[dict]] = {}
+    by_condition_speed: dict[tuple[str, float], list[dict]] = {}
+    for row in rows:
+        by_condition.setdefault(row["condition"], []).append(row)
+        by_condition_speed.setdefault((row["condition"], row["speed_cm_s"]), []).append(row)
+
+    def success_rate(group: list[dict]) -> float:
+        return float(np.mean([row["success"] for row in group])) if group else float("nan")
+
+    def no_contact(group: list[dict]) -> int:
+        return sum(not np.isfinite(row["contact_position_error_mm"]) for row in group)
+
+    def count_failure(group: list[dict], label: str) -> int:
+        return sum(row["main_failure"] == label for row in group)
+
+    base = by_condition.get("dynamic_tau0", [])
+    v1 = by_condition.get("feasibility_aware_replay", [])
+    v2 = by_condition.get("feasibility_aware_replay_v2", [])
+    base_2 = by_condition_speed.get(("dynamic_tau0", 2.0), [])
+    base_4 = by_condition_speed.get(("dynamic_tau0", 4.0), [])
+    base_8 = by_condition_speed.get(("dynamic_tau0", 8.0), [])
+    v1_2 = by_condition_speed.get(("feasibility_aware_replay", 2.0), [])
+    v1_4 = by_condition_speed.get(("feasibility_aware_replay", 4.0), [])
+    v1_8 = by_condition_speed.get(("feasibility_aware_replay", 8.0), [])
+    v2_2 = by_condition_speed.get(("feasibility_aware_replay_v2", 2.0), [])
+    v2_4 = by_condition_speed.get(("feasibility_aware_replay_v2", 4.0), [])
+    v2_8 = by_condition_speed.get(("feasibility_aware_replay_v2", 8.0), [])
+    v1_progress = finite_mean(row.get("final_demo_progress_pct", float("nan")) for row in v1)
+    v2_progress = finite_mean(row.get("final_demo_progress_pct", float("nan")) for row in v2)
+    v1_freeze = finite_mean(float(row.get("n_phase_freeze_frames", 0)) for row in v1)
+    v2_freeze = finite_mean(float(row.get("n_phase_freeze_frames", 0)) for row in v2)
+    v2_pressure = finite_mean(float(row.get("n_progress_pressure_frames", 0)) for row in v2)
+    v2_catchup = finite_mean(float(row.get("n_catchup_frames", 0)) for row in v2)
+    v2_emergency = finite_mean(float(row.get("n_emergency_freeze_frames", 0)) for row in v2)
+    v2_max_target_velocity = finite_mean(row.get("max_target_velocity_mm_s", float("nan")) for row in v2)
+    v2_mean_target_velocity = finite_mean(row.get("mean_target_velocity_mm_s", float("nan")) for row in v2)
+    progress_reasons: dict[str, int] = {}
+    dominant_reasons: dict[str, int] = {}
+    for row in v2:
+        reason = row.get("phase_progress_failure_reason", "unknown")
+        progress_reasons[reason] = progress_reasons.get(reason, 0) + 1
+        dominant = row.get("dominant_feasibility_fail_reason", "unknown")
+        dominant_reasons[dominant] = dominant_reasons.get(dominant, 0) + 1
+
+    preserves_low_mid = bool(base_2 and base_4 and v2_2 and v2_4) and (
+        success_rate(v2_2) >= success_rate(v1_2)
+        and success_rate(v2_4) >= success_rate(v1_4)
+        and success_rate(v2_4) >= success_rate(base_4)
+    )
+    retains_8_signal = bool(v1_8 and v2_8 and base_8) and (
+        success_rate(v2_8) >= success_rate(base_8)
+        and success_rate(v2_8) >= success_rate(v1_8)
+    )
+    progress_fixed = bool(v2) and v2_progress >= 95.0 and v2_progress >= v1_progress
+    freezes_reduced = bool(v2) and v2_freeze < v1_freeze
+    if preserves_low_mid and retains_8_signal and progress_fixed:
+        recommendation = "PROCEED_TO_FEASIBILITY_AWARE_V2_FORMAL"
+    elif v2 and (v2_progress < 90.0 or not freezes_reduced):
+        recommendation = "FIX_FEASIBILITY_V2_LOGIC_FIRST"
+    elif v2 and success_rate(v2) <= success_rate(base):
+        recommendation = "FEASIBILITY_AWARE_STILL_NOT_PROMISING"
+    else:
+        recommendation = "ABANDON_FEASIBILITY_AWARE_REPLAY"
+
+    return [
+        "",
+        "## Stage 7B.1 Feasibility-Aware Replay v2 Questions",
+        "",
+        f"1. Does v2 preserve 2/4 cm/s dynamic_tau0 performance better than v1? 2 cm/s: dynamic_tau0={success_rate(base_2):.3f}, v1={success_rate(v1_2):.3f}, v2={success_rate(v2_2):.3f}; 4 cm/s: dynamic_tau0={success_rate(base_4):.3f}, v1={success_rate(v1_4):.3f}, v2={success_rate(v2_4):.3f}.",
+        f"2. Does v2 retain the 8 cm/s improvement signal? dynamic_tau0 8 cm/s success_rate={success_rate(base_8):.3f}, no_contact={no_contact(base_8)}, attempt_limit={count_failure(base_8, 'attempt_limit')}; v1 8 cm/s success_rate={success_rate(v1_8):.3f}; v2 8 cm/s success_rate={success_rate(v2_8):.3f}, no_contact={no_contact(v2_8)}, attempt_limit={count_failure(v2_8, 'attempt_limit')}.",
+        f"3. Does final_demo_progress_pct improve over v1? v1_mean={v1_progress:.3f}, v2_mean={v2_progress:.3f}; v2_progress_failure_reasons={progress_reasons}.",
+        f"4. Are freeze frames reduced? v1_mean_freeze_frames={v1_freeze:.3f}, v2_mean_freeze_frames={v2_freeze:.3f}, v2_emergency_freeze_frames={v2_emergency:.3f}; dominant_v2_fail_reasons={dominant_reasons}.",
+        f"5. Does progress pressure cause unsafe fast replay? v2_mean_target_velocity={v2_mean_target_velocity:.3f} mm/s, v2_max_target_velocity_mean={v2_max_target_velocity:.3f} mm/s, progress_pressure_frames={v2_pressure:.3f}, catchup_frames={v2_catchup:.3f}. This smoke does not change success thresholds, so these values should be interpreted with contact and failure counts rather than as standalone proof.",
+        "6. Is v2 still MT3-aligned? Yes in implementation: it keeps T_target(t)=T_delta(t) @ T_demo(s(t)), controls only demo phase rate, and keeps gripper commands tied to s(t). It does not add grasp-specific phase labels or close triggers.",
+        f"7. Is v2 promising enough for a 10-trial formal comparison? Recommendation: {recommendation}.",
+        "8. If not, should feasibility-aware replay be abandoned? If v2 still cannot preserve 2/4 cm/s or complete the demo reliably, the next scientifically honest decision is to abandon this heuristic line rather than tune thresholds around smoke results.",
+        "",
+        recommendation,
+    ]
+
+
 def write_baseline_audit(path: Path) -> None:
     lines = [
         "# Baseline Implementation Audit",
@@ -1380,6 +1640,10 @@ def log_condition_verification(conditions: list[str]) -> None:
             print("  dynamic_tau0_close_retimed: dynamic_tau0 plus close-phase gripper retiming, tau=0.0, model=CVModel, adaptive_replay=true")
         elif condition == "dynamic_phase_servo":
             print("  dynamic_phase_servo: dynamic_tau0 tracker plus explicit APPROACH/PREGRASP_SERVO/CLOSE/VERIFY_ATTACH/LIFT phase controller, tau=0.0, model=CVModel")
+        elif condition == "feasibility_aware_replay":
+            print("  feasibility_aware_replay: dynamic_tau0 tracker plus MT3-style adaptive demo phase progression s_dot, tau=0.0, model=CVModel")
+        elif condition == "feasibility_aware_replay_v2":
+            print("  feasibility_aware_replay_v2: dynamic_tau0 tracker plus MT3-style adaptive demo phase progression with progress pressure and emergency-only freezes, tau=0.0, model=CVModel")
         elif condition == "dynamic_cv":
             print("  dynamic_cv: tracker.update=true, get_target_pose=true, tau=0.1, model=CVModel, adaptive_replay=true")
         elif condition == "dynamic_ct":
@@ -1428,6 +1692,17 @@ def run_one_trial(
     pregrasp_timeout_s: float,
     close_timeout_s: float,
     verify_attach_timeout_s: float,
+    max_target_step_mm: float,
+    max_target_velocity_mm_s: float,
+    max_ee_to_target_error_mm: float,
+    freeze_if_error_above_mm: float,
+    min_progress_rate: float,
+    max_progress_rate: float,
+    min_normal_progress_rate: float,
+    emergency_freeze_error_mm: float,
+    progress_lag_slow_threshold: float,
+    progress_lag_catchup_threshold: float,
+    error_trend_window_s: float,
 ) -> dict:
     condition = trial_spec["condition"]
     if not trial_spec["available"]:
@@ -1477,6 +1752,19 @@ def run_one_trial(
         pregrasp_timeout_s=pregrasp_timeout_s,
         close_timeout_s=close_timeout_s,
         verify_attach_timeout_s=verify_attach_timeout_s,
+        feasibility_aware_enabled=bool(trial_spec.get("feasibility_aware_enabled", False)),
+        feasibility_aware_v2_enabled=bool(trial_spec.get("feasibility_aware_v2_enabled", False)),
+        max_target_step_mm=max_target_step_mm,
+        max_target_velocity_mm_s=max_target_velocity_mm_s,
+        max_ee_to_target_error_mm=max_ee_to_target_error_mm,
+        freeze_if_error_above_mm=freeze_if_error_above_mm,
+        min_progress_rate=min_progress_rate,
+        max_progress_rate=max_progress_rate,
+        min_normal_progress_rate=min_normal_progress_rate,
+        emergency_freeze_error_mm=emergency_freeze_error_mm,
+        progress_lag_slow_threshold=progress_lag_slow_threshold,
+        progress_lag_catchup_threshold=progress_lag_catchup_threshold,
+        error_trend_window_s=error_trend_window_s,
         diagnostics_path=diagnostics_path,
         attempt_diagnostics_path=attempt_diagnostics_path,
         condition_label=condition,
@@ -1568,6 +1856,24 @@ def run_one_trial(
         "phase_close_trigger_ee_to_object_mm": float(result.phase_close_trigger_ee_to_object_mm),
         "attach_verified": bool(result.attach_verified),
         "phase_timeout": bool(result.phase_timeout),
+        "feasibility_aware_enabled": bool(result.feasibility_aware_enabled),
+        "mean_phase_rate": float(result.mean_phase_rate),
+        "min_phase_rate": float(result.min_phase_rate),
+        "max_phase_rate": float(result.max_phase_rate),
+        "n_phase_freeze_frames": int(result.n_phase_freeze_frames),
+        "n_phase_slowdown_frames": int(result.n_phase_slowdown_frames),
+        "n_progress_pressure_frames": int(result.n_progress_pressure_frames),
+        "n_catchup_frames": int(result.n_catchup_frames),
+        "mean_progress_lag": float(result.mean_progress_lag),
+        "max_progress_lag": float(result.max_progress_lag),
+        "n_emergency_freeze_frames": int(result.n_emergency_freeze_frames),
+        "dominant_feasibility_fail_reason": result.dominant_feasibility_fail_reason,
+        "mean_target_velocity_mm_s": float(result.mean_target_velocity_mm_s),
+        "max_target_velocity_mm_s": float(result.max_target_velocity_mm_s),
+        "mean_feasibility_ee_to_target_error_mm": float(result.mean_feasibility_ee_to_target_error_mm),
+        "max_feasibility_ee_to_target_error_mm": float(result.max_feasibility_ee_to_target_error_mm),
+        "final_demo_progress_pct": float(result.final_demo_progress_pct),
+        "phase_progress_failure_reason": result.phase_progress_failure_reason,
         "contact_position_error_mm": float(result.contact_position_error_mm),
         "orientation_error_deg": float(result.orientation_error_deg),
         "approach_error_mm": float(result.approach_max_error_mm),
@@ -1693,6 +1999,17 @@ def main() -> int:
                                 pregrasp_timeout_s=args.pregrasp_timeout_s,
                                 close_timeout_s=args.close_timeout_s,
                                 verify_attach_timeout_s=args.verify_attach_timeout_s,
+                                max_target_step_mm=args.max_target_step_mm,
+                                max_target_velocity_mm_s=args.max_target_velocity_mm_s,
+                                max_ee_to_target_error_mm=args.max_ee_to_target_error_mm,
+                                freeze_if_error_above_mm=args.freeze_if_error_above_mm,
+                                min_progress_rate=args.min_progress_rate,
+                                max_progress_rate=args.max_progress_rate,
+                                min_normal_progress_rate=args.min_normal_progress_rate,
+                                emergency_freeze_error_mm=args.emergency_freeze_error_mm,
+                                progress_lag_slow_threshold=args.progress_lag_slow_threshold,
+                                progress_lag_catchup_threshold=args.progress_lag_catchup_threshold,
+                                error_trend_window_s=args.error_trend_window_s,
                             )
                             rows.append(row)
                             append_raw_row(raw_path, row)
