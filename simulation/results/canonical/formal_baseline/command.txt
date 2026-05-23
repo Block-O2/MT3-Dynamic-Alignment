@@ -1,0 +1,1 @@
+/opt/homebrew/Caskroom/miniconda/base/envs/dynamic_mt3/bin/python /Users/hankli/Desktop/coding/dynamic_mt3/simulation/run_experiment.py --stage-name formal_baseline --conditions static_replay dynamic_tau0 dynamic_cv dynamic_ct --speeds 2.0 4.0 6.0 8.0 --trials 10 --seed 42 --output-root simulation/results/experiments

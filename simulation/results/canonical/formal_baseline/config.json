@@ -1,0 +1,60 @@
+{
+  "condition_definitions": {
+    "dynamic_ct": {
+      "available": true,
+      "description": "Moving object, CT/EKF dynamic replay using the existing CTModel.",
+      "replay_mode": "dynamic_ct",
+      "tau": 0.1
+    },
+    "dynamic_cv": {
+      "available": true,
+      "description": "Moving object, current CV Kalman dynamic replay with tau=0.1.",
+      "replay_mode": "dynamic_cv",
+      "tau": 0.1
+    },
+    "dynamic_tau0": {
+      "available": true,
+      "description": "Moving object, tracked object-frame replay with no prediction ahead.",
+      "replay_mode": "dynamic_tau0",
+      "tau": 0.0
+    },
+    "static_replay": {
+      "available": true,
+      "description": "Moving object, replay static demo without object-frame compensation.",
+      "replay_mode": "static_replay",
+      "tau": null
+    }
+  },
+  "conditions": [
+    "static_replay",
+    "dynamic_tau0",
+    "dynamic_cv",
+    "dynamic_ct"
+  ],
+  "core_method_unchanged": true,
+  "record_diagnostics": false,
+  "recorded_constants": {
+    "approach_horizontal_tolerance_m": 0.02,
+    "contact_position_tolerance_m": 0.015,
+    "fixed_constraint_simplification": true,
+    "grasp_attach_distance_m": 0.085,
+    "lift_success_margin_m": 0.05,
+    "max_grasp_attempts": 3,
+    "orientation_tolerance_deg": 20.0,
+    "replay_duration_s": 25.0,
+    "tau_default_s": 0.1,
+    "tracking_metric_warmup_s": 1.0
+  },
+  "same_robot_object_trajectory_controller_thresholds": true,
+  "seed": 42,
+  "source_script": "simulation/10_grasping_experiment.py",
+  "speeds_cm_s": [
+    2.0,
+    4.0,
+    6.0,
+    8.0
+  ],
+  "stage_name": "formal_baseline",
+  "tau_note": "tau represents measured perception+computation+actuation delay. It is recorded as an interface consistency parameter, not tuned here.",
+  "trials": 10
+}

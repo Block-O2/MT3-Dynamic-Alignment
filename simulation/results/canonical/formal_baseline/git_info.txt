@@ -1,0 +1,8 @@
+branch: experiment-tryouts
+commit: 17c8aa47ade863d65b08e407c56b9346f50f2969
+status:
+M simulation/10_grasping_experiment.py
+?? AGENTS.md
+?? simulation/results/experiments/
+?? simulation/run_experiment.py
+?? simulation/run_grasping_experiment.py

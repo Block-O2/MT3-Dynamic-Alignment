@@ -19,3 +19,8 @@ env/
 
 # 辅助脚本
 simulation/01_hello_pybullet.py
+
+# Intermediate experiment outputs
+simulation/results/experiments/
+simulation/results/archive/
+simulation/results/scratch/
