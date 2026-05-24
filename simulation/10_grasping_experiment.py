@@ -17,17 +17,21 @@ alignment/replay question instead of PyBullet contact tuning.
 Outputs:
 - simulation/results/plot/grasping_demo.gif
 - simulation/results/plot/grasping_success_rate.png
-- simulation/results/raw/10_grasping_final_seed42.csv
+- simulation/results/canonical/ablation_<timestamp>/
 """
 
 from __future__ import annotations
 
 import csv
+import json
 import importlib.util
 import math
 import os
 import random
+import shlex
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -72,8 +76,15 @@ sim03 = load_closed_loop_module()
 
 USE_GUI = False
 TEST_SPEEDS_CM_S = (2.0, 4.0, 6.0, 8.0)
-N_TRIALS = 10
+N_TRIALS = 20
 TAU = 0.1
+CONDITIONS = [
+    "static_replay",
+    "dynamic_tau0",
+    "oracle_pose",
+    "raw_observation",
+    "uncertainty_gated",
+]
 RADIUS = 0.15
 STATIC_BOX_POS = np.array(
     [0.5, 0.0, sim03.TABLE_TOP_Z + sim03.BOX_HALF_EXTENT],
@@ -470,6 +481,48 @@ def reset_adaptive_replay_state(tracker: DynamicAlignmentTracker, demo_clock: li
     tracker._adaptive_last_t_demo = None
 
 
+def make_translation_delta(delta_xy: np.ndarray) -> np.ndarray:
+    """Build a pure-translation homogeneous transform from an XY offset."""
+    t_delta = np.eye(4, dtype=float)
+    t_delta[:2, 3] = np.asarray(delta_xy, dtype=float)[:2]
+    return t_delta
+
+
+def current_git_commit_hash() -> str:
+    """Return the current git commit hash, or unknown outside a git checkout."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
+
+
+def create_ablation_output_dir(timestamp: str) -> Path:
+    """Create the canonical ablation output directory."""
+    out_dir = PROJECT_ROOT / "simulation" / "results" / "canonical" / f"ablation_{timestamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def write_run_metadata(out_dir: Path, timestamp: str) -> None:
+    """Save the command line and experiment configuration for reproducibility."""
+    (out_dir / "command.txt").write_text(shlex.join(sys.argv) + "\n")
+    config = {
+        "timestamp": timestamp,
+        "git_commit_hash": current_git_commit_hash(),
+        "SEED": SEED,
+        "N_TRIALS": N_TRIALS,
+        "TAU": TAU,
+        "TEST_SPEEDS_CM_S": list(TEST_SPEEDS_CM_S),
+        "CONDITIONS": CONDITIONS,
+    }
+    (out_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+
 def make_video_camera_matrices() -> tuple[list[float], list[float]]:
     """Create a side camera for the representative grasping GIF."""
     view_matrix = p.computeViewMatrix(
@@ -546,11 +599,15 @@ def save_demo_gif(frames: list[Image.Image], out_path: Path) -> None:
 
 def run_trial(
     speed_cm_s: float,
-    moving_object: bool,
+    condition: str,
     trial_idx: int,
     record_gif: bool = False,
 ) -> TrialResult:
     """Run one static-baseline or moving-object grasp trial."""
+    moving_object = True
+    if condition not in CONDITIONS:
+        raise ValueError(f"Unknown condition: {condition}")
+
     client_id = p.connect(p.GUI if USE_GUI else p.DIRECT)
     if client_id < 0:
         raise RuntimeError("Failed to connect to PyBullet")
@@ -583,7 +640,11 @@ def run_trial(
         for _ in range(30):
             command_and_step(panda_id, STATIC_BOX_POS + START_OFFSET, ik_params, OPEN_GRIPPER)
 
-        tracker = make_tracker(reference_cloud)
+        tracker = (
+            make_tracker(reference_cloud)
+            if condition in ("dynamic_tau0", "uncertainty_gated")
+            else None
+        )
         constraint_id: int | None = None
         max_box_z = float(STATIC_BOX_POS[2])
         final_box_z = float(STATIC_BOX_POS[2])
@@ -599,6 +660,8 @@ def run_trial(
         lateral_error_window: list[float] = []
         demo_target_error_window: list[float] = []
         aborted_by_attempt_limit = False
+        reference_centroid = reference_cloud.mean(axis=0)
+        raw_observation_delta = np.eye(4, dtype=float)
 
         n_steps = int(REPLAY_DURATION * sim03.FPS)
         for frame_idx in range(n_steps + 1):
@@ -608,57 +671,86 @@ def run_trial(
                 box_pos = moving_box_position(replay_t + trial_idx * 0.17, speed_cm_s)
                 p.resetBasePositionAndOrientation(box_id, box_pos.tolist(), [0.0, 0.0, 0.0, 1.0])
                 p.resetBaseVelocity(box_id, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
-            elif not moving_object and constraint_id is None:
-                p.resetBasePositionAndOrientation(box_id, STATIC_BOX_POS.tolist(), [0.0, 0.0, 0.0, 1.0])
-                p.resetBaseVelocity(box_id, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
 
             if moving_object:
-                ee_pos_before_command = sim03.get_ee_position(panda_id)
-                cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
-                if frame_idx == 0:
+                if condition == "static_replay":
+                    if frame_idx > 0:
+                        demo_clock[0] = min(demo_clock[0] + sim03.DT, demo.poses.duration)
                     target_pose = demo.poses.get_pose_at(demo_clock[0])
-                    lateral_error_mm = 0.0
-                else:
-                    tracker.update(cloud, timestamp=replay_t)
-                    alignment_pose = tracker.get_target_pose(
-                        demo.poses,
-                        t_demo=0.0,
-                        tau=TAU,
-                    )
-                    alignment_target = np.asarray(alignment_pose[:3, 3], dtype=float)
-                    lateral_error_mm = float(
-                        np.linalg.norm((ee_pos_before_command - alignment_target)[:2]) * 1000.0
-                    )
-                    smoothed_lateral_error_mm = smooth_append(
-                        lateral_error_window,
-                        lateral_error_mm,
-                        LATERAL_ERROR_SMOOTHING_FRAMES,
-                    )
-                    demo_clock[0] = min(demo_clock[0] + sim03.DT, demo.poses.duration)
-                    previous_progress_sum = tracker._adaptive_progress_sum
-                    adaptive_threshold_mm = (
-                        DESCENT_GATE_THRESHOLD_M * 1000.0
-                        if is_descent_phase(demo.poses, demo_clock[0])
-                        else CONTACT_POSITION_TOLERANCE_M * 1000.0
-                    )
-                    target_pose, _ = tracker.get_target_pose_adaptive(
-                        demo.poses,
-                        t_demo=demo_clock,
-                        lateral_error_mm=smoothed_lateral_error_mm,
-                        threshold_mm=adaptive_threshold_mm,
-                        tau=TAU,
-                    )
-                    frame_progress_rate = tracker._adaptive_progress_sum - previous_progress_sum
-                    if DEBUG_ADAPTIVE_GATE and frame_idx % 30 == 0:
-                        print(
-                            f"adaptive debug frame={frame_idx:03d} "
-                            f"lateral_error={lateral_error_mm:.1f}mm "
-                            f"smoothed={smoothed_lateral_error_mm:.1f}mm "
-                            f"threshold={adaptive_threshold_mm:.1f}mm "
-                            f"progress_rate={frame_progress_rate:.2f} "
-                            f"t_demo={demo_clock[0]:.3f}s "
-                            f"duration={demo.poses.duration:.3f}s"
+                elif condition in ("dynamic_tau0", "uncertainty_gated"):
+                    if tracker is None:
+                        raise RuntimeError(f"Tracker unavailable for condition {condition}")
+                    ee_pos_before_command = sim03.get_ee_position(panda_id)
+                    cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
+                    if frame_idx == 0:
+                        target_pose = demo.poses.get_pose_at(demo_clock[0])
+                        lateral_error_mm = 0.0
+                    else:
+                        tracker.update(cloud, timestamp=replay_t)
+                        alignment_pose = tracker.get_target_pose(
+                            demo.poses,
+                            t_demo=0.0,
+                            tau=TAU,
                         )
+                        alignment_target = np.asarray(alignment_pose[:3, 3], dtype=float)
+                        lateral_error_mm = float(
+                            np.linalg.norm((ee_pos_before_command - alignment_target)[:2]) * 1000.0
+                        )
+                        smoothed_lateral_error_mm = smooth_append(
+                            lateral_error_window,
+                            lateral_error_mm,
+                            LATERAL_ERROR_SMOOTHING_FRAMES,
+                        )
+                        if condition == "uncertainty_gated":
+                            smoothed_lateral_error_mm = float(
+                                np.sqrt(np.trace(tracker.current_state.P[:2, :2])) * 1000.0
+                            )
+                        demo_clock[0] = min(demo_clock[0] + sim03.DT, demo.poses.duration)
+                        previous_progress_sum = tracker._adaptive_progress_sum
+                        adaptive_threshold_mm = (
+                            DESCENT_GATE_THRESHOLD_M * 1000.0
+                            if is_descent_phase(demo.poses, demo_clock[0])
+                            else CONTACT_POSITION_TOLERANCE_M * 1000.0
+                        )
+                        target_pose, _ = tracker.get_target_pose_adaptive(
+                            demo.poses,
+                            t_demo=demo_clock,
+                            lateral_error_mm=smoothed_lateral_error_mm,
+                            threshold_mm=adaptive_threshold_mm,
+                            tau=TAU,
+                        )
+                        frame_progress_rate = tracker._adaptive_progress_sum - previous_progress_sum
+                        if DEBUG_ADAPTIVE_GATE and frame_idx % 30 == 0:
+                            print(
+                                f"adaptive debug frame={frame_idx:03d} "
+                                f"lateral_error={lateral_error_mm:.1f}mm "
+                                f"smoothed={smoothed_lateral_error_mm:.1f}mm "
+                                f"threshold={adaptive_threshold_mm:.1f}mm "
+                                f"progress_rate={frame_progress_rate:.2f} "
+                                f"t_demo={demo_clock[0]:.3f}s "
+                                f"duration={demo.poses.duration:.3f}s"
+                            )
+                elif condition == "oracle_pose":
+                    box_pos = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+                    t_delta = make_translation_delta(box_pos[:2] - STATIC_BOX_POS[:2])
+                    if frame_idx > 0:
+                        demo_clock[0] = min(demo_clock[0] + sim03.DT, demo.poses.duration)
+                    target_pose = t_delta @ demo.poses.get_pose_at(demo_clock[0])
+                elif condition == "raw_observation":
+                    cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
+                    if cloud.shape[0] >= 20:
+                        cloud_centroid = cloud.mean(axis=0)
+                        raw_observation_delta = make_translation_delta(
+                            cloud_centroid[:2] - reference_centroid[:2]
+                        )
+                        if frame_idx > 0:
+                            demo_clock[0] = min(demo_clock[0] + sim03.DT, demo.poses.duration)
+                    else:
+                        # Freeze both the observation delta and demo clock on invalid clouds.
+                        pass
+                    target_pose = raw_observation_delta @ demo.poses.get_pose_at(demo_clock[0])
+                else:
+                    raise RuntimeError(f"Unsupported moving condition: {condition}")
                 t_demo = demo_clock[0]
             else:
                 t_demo = min(replay_t, demo.poses.duration)
@@ -681,15 +773,29 @@ def run_trial(
                         aborted_by_attempt_limit = True
                         break
 
-                    reset_adaptive_replay_state(tracker, demo_clock)
+                    demo_clock[0] = 0.0
+                    if tracker is not None:
+                        reset_adaptive_replay_state(tracker, demo_clock)
                     approach_errors_xy.clear()
                     lateral_error_window.clear()
                     demo_target_error_window.clear()
-                    target_pose = tracker.get_target_pose(
-                        demo.poses,
-                        t_demo=0.0,
-                        tau=TAU,
-                    )
+                    if condition in ("dynamic_tau0", "uncertainty_gated"):
+                        if tracker is None:
+                            raise RuntimeError(f"Tracker unavailable for condition {condition}")
+                        target_pose = tracker.get_target_pose(
+                            demo.poses,
+                            t_demo=0.0,
+                            tau=TAU,
+                        )
+                    elif condition == "oracle_pose":
+                        box_pos = np.array(p.getBasePositionAndOrientation(box_id)[0], dtype=float)
+                        target_pose = make_translation_delta(
+                            box_pos[:2] - STATIC_BOX_POS[:2]
+                        ) @ demo.poses.get_pose_at(0.0)
+                    elif condition == "raw_observation":
+                        target_pose = raw_observation_delta @ demo.poses.get_pose_at(0.0)
+                    else:
+                        target_pose = demo.poses.get_pose_at(0.0)
                     command_and_step(
                         panda_id,
                         np.asarray(target_pose[:3, 3], dtype=float),
@@ -764,7 +870,7 @@ def run_trial(
         success=success,
         final_lift_m=final_lift_m,
         max_lift_m=max_lift_m,
-        progress_rate=tracker.progress_rate if moving_object else 1.0,
+        progress_rate=tracker.progress_rate if tracker is not None else 1.0,
         lift_success=lift_success,
         position_success=position_success,
         orientation_success=orientation_success,
@@ -845,26 +951,28 @@ def append_raw_csv_row(
 
 def run_all_trials() -> dict[str, dict[float, list[TrialResult]]]:
     """Run static baseline and moving-object grasp trials."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = create_ablation_output_dir(timestamp)
+    write_run_metadata(out_dir, timestamp)
     results: dict[str, dict[float, list[TrialResult]]] = {
-        "Static baseline": {},
-        "Moving object": {},
+        condition: {} for condition in CONDITIONS
     }
-    raw_csv_path = PROJECT_ROOT / "simulation" / "results" / "raw" / "10_grasping_final_seed42.csv"
+    raw_csv_path = out_dir / "raw_trials.csv"
     initialize_raw_csv(raw_csv_path)
     for speed in TEST_SPEEDS_CM_S:
-        for label, moving in (("Static baseline", False), ("Moving object", True)):
+        for condition in CONDITIONS:
             trial_results = []
             for trial_idx in range(N_TRIALS):
                 record_gif = (
-                    moving
+                    condition == "dynamic_tau0"
                     and speed == RECORD_REPRESENTATIVE_SPEED_CM_S
                     and trial_idx == RECORD_REPRESENTATIVE_TRIAL
                 )
-                result = run_trial(speed, moving, trial_idx, record_gif=record_gif)
+                result = run_trial(speed, condition, trial_idx, record_gif=record_gif)
                 trial_results.append(result)
-                append_raw_csv_row(raw_csv_path, label, speed, trial_idx, result)
+                append_raw_csv_row(raw_csv_path, condition, speed, trial_idx, result)
                 print(
-                    f"{label:15s} speed={speed:4.1f}cm/s "
+                    f"{condition:17s} speed={speed:4.1f}cm/s "
                     f"trial={trial_idx + 1}/{N_TRIALS}: "
                     f"success={result.success}, "
                     f"lift={result.final_lift_m * 1000.0:.1f}mm, "
@@ -873,7 +981,8 @@ def run_all_trials() -> dict[str, dict[float, list[TrialResult]]]:
                     f"approach={result.approach_max_error_mm:.1f}mm, "
                     f"progress={result.progress_rate * 100.0:.1f}%"
                 )
-            results[label][speed] = trial_results
+            results[condition][speed] = trial_results
+    print(f"Saved raw trial results to {raw_csv_path.relative_to(PROJECT_ROOT)}")
     return results
 
 
@@ -976,9 +1085,9 @@ def print_summary_table(results: dict[str, dict[float, list[TrialResult]]]) -> N
     """Print full success-rate table."""
     print()
     print("Grasping experiment summary")
-    print("condition       | speed_cm_s | success_rate_% | progress_% | mean_lift_mm | pos_err_mm | ori_err_deg | approach_mm | main_failure")
-    print("----------------|------------|----------------|------------|--------------|------------|-------------|-------------|-------------")
-    for label in ("Static baseline", "Moving object"):
+    print("condition         | speed_cm_s | success_rate_% | progress_% | mean_lift_mm | pos_err_mm | ori_err_deg | approach_mm | main_failure")
+    print("------------------|------------|----------------|------------|--------------|------------|-------------|-------------|-------------")
+    for label in CONDITIONS:
         for speed in TEST_SPEEDS_CM_S:
             trial_results = results[label][speed]
             successes = np.array([r.success for r in trial_results], dtype=float)
@@ -994,7 +1103,7 @@ def print_summary_table(results: dict[str, dict[float, list[TrialResult]]]) -> N
             main_failure = max(counts.items(), key=lambda item: item[1])
             failure_label = main_failure[0] if main_failure[1] > 0 else "none"
             print(
-                f"{label:15s} | {speed:10.1f} | "
+                f"{label:17s} | {speed:10.1f} | "
                 f"{successes.mean() * 100.0:6.1f} ± {successes.std(ddof=0) * 100.0:4.1f} | "
                 f"{progress_rates.mean():6.1f} ± {progress_rates.std(ddof=0):4.1f} | "
                 f"{lifts.mean():7.1f} ± {lifts.std(ddof=0):4.1f} | "
@@ -1006,13 +1115,13 @@ def print_summary_table(results: dict[str, dict[float, list[TrialResult]]]) -> N
 
     print()
     print("Failure diagnosis")
-    print("condition       | speed_cm_s | lift | position | orientation | approach | attempt_limit")
-    print("----------------|------------|------|----------|-------------|----------|--------------")
-    for label in ("Static baseline", "Moving object"):
+    print("condition         | speed_cm_s | lift | position | orientation | approach | attempt_limit")
+    print("------------------|------------|------|----------|-------------|----------|--------------")
+    for label in CONDITIONS:
         for speed in TEST_SPEEDS_CM_S:
             counts = failure_counts(results[label][speed])
             print(
-                f"{label:15s} | {speed:10.1f} | "
+                f"{label:17s} | {speed:10.1f} | "
                 f"{counts['lift']:4d} | {counts['position']:8d} | "
                 f"{counts['orientation']:11d} | {counts['approach']:8d} | "
                 f"{counts['attempt_limit']:13d}"
@@ -1020,14 +1129,17 @@ def print_summary_table(results: dict[str, dict[float, list[TrialResult]]]) -> N
 
 
 def plot_success_rates(results: dict[str, dict[float, list[TrialResult]]], out_path: Path) -> None:
-    """Plot static-baseline and moving-object grasp success rate by speed."""
+    """Plot grasp success rate by speed for each condition."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     speeds = np.asarray(TEST_SPEEDS_CM_S, dtype=float)
 
     plt.figure(figsize=(8, 4.8))
     styles = {
-        "Static baseline": ("tab:blue", "o"),
-        "Moving object": ("tab:orange", "s"),
+        "static_replay": ("tab:blue", "o"),
+        "dynamic_tau0": ("tab:orange", "s"),
+        "oracle_pose": ("tab:green", "^"),
+        "raw_observation": ("tab:red", "D"),
+        "uncertainty_gated": ("tab:purple", "v"),
     }
     for label, (color, marker) in styles.items():
         success_rates = np.array(
@@ -1100,7 +1212,6 @@ def main() -> None:
     print_summary_table(results)
     plot_dir = PROJECT_ROOT / "simulation" / "results" / "plot"
     plot_success_rates(results, plot_dir / "grasping_success_rate.png")
-    print("Saved simulation/results/raw/10_grasping_final_seed42.csv")
     print("Saved simulation/results/plot/grasping_success_rate.png")
     print("Saved simulation/results/plot/grasping_demo.gif")
 
