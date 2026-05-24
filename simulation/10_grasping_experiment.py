@@ -15,8 +15,6 @@ the gripper closes near the box. This keeps the experiment focused on the MT3
 alignment/replay question instead of PyBullet contact tuning.
 
 Outputs:
-- simulation/results/plot/grasping_demo.gif
-- simulation/results/plot/grasping_success_rate.png
 - simulation/results/canonical/ablation_<timestamp>/
 """
 
@@ -61,8 +59,8 @@ from dynamic_alignment.types import DemoData
 
 
 def load_closed_loop_module():
-    """Load simulation/03_closed_loop.py despite its digit-prefixed filename."""
-    module_path = Path(__file__).resolve().with_name("03_closed_loop.py")
+    """Load simulation/dev/03_closed_loop.py despite its digit-prefixed filename."""
+    module_path = Path(__file__).resolve().parent / "dev" / "03_closed_loop.py"
     spec = importlib.util.spec_from_file_location("closed_loop_sim", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load {module_path}")
@@ -601,6 +599,7 @@ def run_trial(
     speed_cm_s: float,
     condition: str,
     trial_idx: int,
+    output_dir: Path,
     record_gif: bool = False,
 ) -> TrialResult:
     """Run one static-baseline or moving-object grasp trial."""
@@ -613,7 +612,6 @@ def run_trial(
         raise RuntimeError("Failed to connect to PyBullet")
 
     gif_frames: list[Image.Image] = []
-    plot_dir = PROJECT_ROOT / "simulation" / "results" / "plot"
 
     try:
         box_id, panda_id, camera_matrices, ik_params = setup_scene()
@@ -860,7 +858,7 @@ def run_trial(
         p.disconnect()
 
     if record_gif:
-        save_demo_gif(gif_frames, plot_dir / "grasping_demo.gif")
+        save_demo_gif(gif_frames, output_dir / "grasping_demo.gif")
 
     final_lift_m = final_box_z - float(STATIC_BOX_POS[2])
     max_lift_m = max_box_z - float(STATIC_BOX_POS[2])
@@ -949,7 +947,12 @@ def append_raw_csv_row(
         )
 
 
-def run_all_trials() -> dict[str, dict[float, list[TrialResult]]]:
+class ExperimentRun(NamedTuple):
+    results: dict[str, dict[float, list[TrialResult]]]
+    output_dir: Path
+
+
+def run_all_trials() -> ExperimentRun:
     """Run static baseline and moving-object grasp trials."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = create_ablation_output_dir(timestamp)
@@ -968,7 +971,13 @@ def run_all_trials() -> dict[str, dict[float, list[TrialResult]]]:
                     and speed == RECORD_REPRESENTATIVE_SPEED_CM_S
                     and trial_idx == RECORD_REPRESENTATIVE_TRIAL
                 )
-                result = run_trial(speed, condition, trial_idx, record_gif=record_gif)
+                result = run_trial(
+                    speed,
+                    condition,
+                    trial_idx,
+                    output_dir=out_dir,
+                    record_gif=record_gif,
+                )
                 trial_results.append(result)
                 append_raw_csv_row(raw_csv_path, condition, speed, trial_idx, result)
                 print(
@@ -983,7 +992,7 @@ def run_all_trials() -> dict[str, dict[float, list[TrialResult]]]:
                 )
             results[condition][speed] = trial_results
     print(f"Saved raw trial results to {raw_csv_path.relative_to(PROJECT_ROOT)}")
-    return results
+    return ExperimentRun(results=results, output_dir=out_dir)
 
 
 def run_tracking_diagnostic(speed_cm_s: float) -> tuple[float, float]:
@@ -1208,12 +1217,12 @@ def main() -> None:
             )
         return
 
-    results = run_all_trials()
-    print_summary_table(results)
-    plot_dir = PROJECT_ROOT / "simulation" / "results" / "plot"
-    plot_success_rates(results, plot_dir / "grasping_success_rate.png")
-    print("Saved simulation/results/plot/grasping_success_rate.png")
-    print("Saved simulation/results/plot/grasping_demo.gif")
+    experiment_run = run_all_trials()
+    print_summary_table(experiment_run.results)
+    success_plot_path = experiment_run.output_dir / "grasping_success_rate.png"
+    plot_success_rates(experiment_run.results, success_plot_path)
+    print(f"Saved {success_plot_path.relative_to(PROJECT_ROOT)}")
+    print(f"Saved {(experiment_run.output_dir / 'grasping_demo.gif').relative_to(PROJECT_ROOT)}")
 
 
 if __name__ == "__main__":
