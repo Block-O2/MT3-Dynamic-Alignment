@@ -2,7 +2,7 @@
 
 Continuous object tracking and latency-compensated demo replay for applying a static MT3 manipulation demonstration to moving objects.
 
-> **Status:** Core algorithm implemented and validated in PyBullet simulation. Hardware validation on Sawyer + RealSense D415 is pending.
+> **Status:** PyBullet simulation study complete. Five-condition ablation (static_replay, raw_observation, dynamic_tau0, uncertainty_gated, oracle_pose) validated across 4 speeds × 20 trials. Hardware validation on Sawyer + RealSense D415 is the identified next step.
 
 ## Demo
 
@@ -20,71 +20,9 @@ T_WE_target(t) = T_delta(t + tau) · T_WE_demo(t)
 
 ## Key Results
 
-### End-to-End Grasping
-
 ![Grasping Success Rate](simulation/results/plot/grasping_success_rate.png)
 
-The final grasping experiment shows an inverted-U speed response: 4-6 cm/s is the best operating range, while very slow motion gives a weak velocity signal and fast motion reaches the controller bandwidth limit.
-
-### Latency Compensation
-
-![Baseline Comparison](simulation/results/plot/baseline_comparison.png)
-
-Predicting 100 ms ahead reduces relative tracking error compared with pure reactive control.
-
-### Robustness
-
-![Robustness Analysis](simulation/results/plot/robustness_analysis.png)
-
-Kalman filtering remains stable under noisy observations, especially when velocity feedforward is degraded by outliers.
-
-### Method Comparison
-
-![Method Comparison](simulation/results/plot/method_comparison_bar.png)
-
-The Kalman + prediction method matches or exceeds the alternative controllers while providing the most reliable steady-state behavior.
-
-<details>
-<summary>Full Experiment Results</summary>
-
-### Tracker Simulation
-
-![XY Trajectory](simulation/results/plot/trajectory_xy.png)
-![Position Error](simulation/results/plot/position_error.png)
-
-The overhead RGB-D simulation tracks a box moving in a circle with millimeter-level steady-state error.
-
-### Closed-Loop Panda Tracking
-
-![Closed-loop 3D trajectories](simulation/results/plot/closed_loop_3d_trajectories.png)
-![Closed-loop relative error](simulation/results/plot/closed_loop_relative_error.png)
-
-The Panda end-effector maintains a constant relative pose to the moving object using tracker output.
-
-### Static Demo to Moving Object
-
-![MT3 Integration Error](simulation/results/plot/mt3_integration_error.png)
-![MT3 Integration Trajectory](simulation/results/plot/mt3_integration_trajectory.png)
-
-A trajectory demonstrated on a static object is replayed on a moving object in the object frame.
-
-### Speed and Motion Sensitivity
-
-![Speed Sensitivity](simulation/results/plot/speed_sensitivity.png)
-![Motion Type Comparison](simulation/results/plot/motion_type_comparison.png)
-
-The system remains effective across multiple object speeds and motion patterns, with degradation near reversal points and high-speed limits.
-
-### Additional Test Figures
-
-![Convergence](simulation/results/plot/convergence.png)
-![Latency Compensation Test](simulation/results/plot/latency_compensation.png)
-![Tracking Comparison](simulation/results/plot/tracking_comparison.png)
-![Method Error Over Time](simulation/results/plot/method_comparison_time.png)
-
-Raw final grasping data is stored at [`simulation/results/raw/10_grasping_final_seed42.csv`](simulation/results/raw/10_grasping_final_seed42.csv).
-
-</details>
+The current PyBullet ablation uses five conditions across four object speeds and 20 trials per speed. `static_replay` achieves 0% success at all speeds, confirming that replaying a static-object demonstration directly on a moving object fails. `dynamic_tau0` reaches 70-85% success at 2-6 cm/s and drops to 25% at 8 cm/s. `oracle_pose` achieves 100% success at all speeds, showing that the controller is not the bottleneck. `raw_observation` achieves 0%, indicating that Kalman filtering is essential. `uncertainty_gated` is comparable to `dynamic_tau0` in simulation; the covariance matrix remains near-constant in PyBullet, so real hardware is needed to distinguish the two.
 
 ## How It Works
 
@@ -105,18 +43,11 @@ MT3_dynamic_alignment/
 │   └── simulate_and_plot.py    Minimal synthetic simulation example
 │
 ├── simulation/                 PyBullet experiments
-│   ├── 02_tracker_sim.py
-│   ├── 03_closed_loop.py
-│   ├── 04_baseline_comparison.py
-│   ├── 05_mt3_integration.py
-│   ├── 06_speed_sensitivity.py
-│   ├── 07_motion_type_comparison.py
-│   ├── 08_method_comparison.py
-│   ├── 09_robustness_analysis.py
+│   ├── dev/                    Development and diagnostic scripts, 02-09_*.py
 │   ├── 10_grasping_experiment.py
 │   └── results/
-│       ├── plot/               Figures and demo GIFs
-│       └── raw/                Raw experiment CSV files
+│       ├── canonical/          Timestamped ablation runs, each containing command.txt, config.json, raw_trials.csv, and plots
+│       └── plot/               Figures and demo GIFs
 │
 ├── tests/                      Hardware-free unit tests
 ├── MT3_dynamic_alignment_notes.md
@@ -171,4 +102,4 @@ See [`MT3_dynamic_alignment_notes.md`](MT3_dynamic_alignment_notes.md) for the d
 
 ## Acknowledgments
 
-This project extends the ideas in MT3 (*Multi-Task Trajectory Transfer*, Science Robotics 2025) from static one-time alignment to continuous object-relative replay.
+This project studies the extension of MT3 (Multi-Task Trajectory Transfer, Science Robotics 2025) demo replay from static to slowly moving tabletop objects, using a single demonstration with no retraining.

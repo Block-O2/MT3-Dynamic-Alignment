@@ -76,6 +76,7 @@ USE_GUI = False
 TEST_SPEEDS_CM_S = (2.0, 4.0, 6.0, 8.0)
 N_TRIALS = 20
 TAU = 0.1
+OCCLUSION_PROB = 0.15
 CONDITIONS = [
     "static_replay",
     "dynamic_tau0",
@@ -486,6 +487,13 @@ def make_translation_delta(delta_xy: np.ndarray) -> np.ndarray:
     return t_delta
 
 
+def maybe_apply_artificial_occlusion(cloud: np.ndarray) -> np.ndarray:
+    """Randomly hide a perception cloud to simulate object occlusion."""
+    if np.random.random() < OCCLUSION_PROB:
+        cloud = np.zeros((0, 3), dtype=float)
+    return cloud
+
+
 def current_git_commit_hash() -> str:
     """Return the current git commit hash, or unknown outside a git checkout."""
     try:
@@ -515,6 +523,7 @@ def write_run_metadata(out_dir: Path, timestamp: str) -> None:
         "SEED": SEED,
         "N_TRIALS": N_TRIALS,
         "TAU": TAU,
+        "OCCLUSION_PROB": OCCLUSION_PROB,
         "TEST_SPEEDS_CM_S": list(TEST_SPEEDS_CM_S),
         "CONDITIONS": CONDITIONS,
     }
@@ -680,6 +689,7 @@ def run_trial(
                         raise RuntimeError(f"Tracker unavailable for condition {condition}")
                     ee_pos_before_command = sim03.get_ee_position(panda_id)
                     cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
+                    cloud = maybe_apply_artificial_occlusion(cloud)
                     if frame_idx == 0:
                         target_pose = demo.poses.get_pose_at(demo_clock[0])
                         lateral_error_mm = 0.0
@@ -736,6 +746,7 @@ def run_trial(
                     target_pose = t_delta @ demo.poses.get_pose_at(demo_clock[0])
                 elif condition == "raw_observation":
                     cloud = sim03.capture_box_cloud(view_matrix, projection_matrix)
+                    cloud = maybe_apply_artificial_occlusion(cloud)
                     if cloud.shape[0] >= 20:
                         cloud_centroid = cloud.mean(axis=0)
                         raw_observation_delta = make_translation_delta(
