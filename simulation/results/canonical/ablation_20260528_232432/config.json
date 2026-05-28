@@ -1,0 +1,22 @@
+{
+  "timestamp": "20260528_232432",
+  "git_commit_hash": "80148c3253726424ea84a4d2c161ba673dc5bd40",
+  "SEED": 42,
+  "N_TRIALS": 20,
+  "TAU": 0.1,
+  "OCCLUSION_PROB": 0.15,
+  "TEST_SPEEDS_CM_S": [
+    2.0,
+    4.0,
+    6.0,
+    8.0
+  ],
+  "CONDITIONS": [
+    "static_replay",
+    "dynamic_tau0",
+    "oracle_pose",
+    "raw_observation",
+    "uncertainty_gated",
+    "pd_feedforward"
+  ]
+}
