@@ -146,3 +146,12 @@ Seed: `42` for reproducibility.
 - PyBullet position-control IK produced roughly 10 mm or larger tracking error, motivating the switch to Cartesian velocity control.
 - The simulation does not model real motor inertia and controller bandwidth in full detail, so real hardware is expected to be harder.
 - Grasping success is defined by strict geometric criteria rather than physical contact force or tactile feedback.
+
+## Note on Final Results
+
+The experiment evolution above (v1–v5) is a development history log.
+The canonical ablation results are in `simulation/results/canonical/` and
+summarized in `ANALYSIS.md`. The final study uses five conditions
+(static_replay, raw_observation, dynamic_tau0, uncertainty_gated,
+oracle_pose) across four speeds and 20 trials per cell, superseding the
+10-trial results shown above.
