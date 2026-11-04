@@ -1,9 +1,10 @@
 # Reproduction and evidence review
 
 Reviewed on **2026-11-04**, starting from `7bf8abc3221671303b4987a10f73b9650fb4ddea`.
-Existing algorithm, experiment and test source files, raw trials, configurations,
-figures, GIFs and the paper PDF are preserved. Documentation and a read-only
-archive-summary utility are the only behavioral additions.
+That review preserved algorithm, experiment and test source files, raw trials,
+configurations, figures and GIFs. Documentation and a read-only archive-summary
+utility were its only behavioral additions. A **2026-11-05** follow-up removed
+the reference paper PDF from the current tree; see the license review below.
 
 ## Environment and installation
 
@@ -129,29 +130,46 @@ real robot integration, and real contact grasping are not validated.
 
 ## Paper and license review
 
-The root paper `2511.10110v1.pdf` is **28,837,171 bytes**, 43 pages; its title is
+### Follow-up decision: 2026-11-05
+
+The former root paper `2511.10110v1.pdf` was **28,837,171 bytes**, 43 pages:
 *Learning a Thousand Tasks in a Day*, by Kamil Dreczkowski, Pietro Vitiello,
-Vitalis Vosylius and Edward Johns. SHA-256:
+Vitalis Vosylius and Edward Johns. The inspected copy's SHA-256 was:
 
 ```text
 4666980d84163a011b91eb32ac7e7df14fb3cfec65d08291c706d005e34aed82
 ```
 
-Its first-page footer says the author's version is provided by permission of
-AAAS for personal use, with redistribution restricted. The [arXiv v1
-record](https://arxiv.org/abs/2511.10110v1) repeats that restriction in Comments,
-but its license link leads to [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/),
-which allows sharing subject to its terms. These signals conflict; this review
-does not resolve which permission governs this bundled copy.
+The review checked this specific copy, the [arXiv v1
+record](https://arxiv.org/abs/2511.10110v1), the [authors' project
+page](https://www.robot-learning.uk/learning-1000-tasks), and the linked
+[Science Robotics article](https://www.science.org/doi/10.1126/scirobotics.adv7594):
 
-No Python entry point or test reads the PDF; it is reference material and is
-not needed for installation or reproduction. The safe next step is to obtain
-clarification from the authors or rights holder. Pending that clarification,
-use the official links and citation below and avoid copying the PDF into new
-release packages. A future, explicitly authorized change can remove the
-bundled copy from the current tree and retain links; that would not remove
-copies in Git history. No deletion, replacement or history rewrite is performed
-in this review, and no repository-wide license is inferred from a paper license.
+- The PDF's first-page footer identifies it as the author's version, posted
+  by permission of AAAS for personal use, with redistribution restricted.
+  The arXiv v1 Comments repeat that restriction.
+- The same PDF's internal `/License` field and arXiv's license link point to
+  [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
+  This does not resolve the conflicting, copy-specific restriction.
+- The authors' page links the paper and publisher, but no explicit permission
+  resolving this copy's redistribution conflict was found there. The publisher
+  page returned HTTP 403 in this check, so its full copyright/rights-holder
+  statement could not be verified. The PDF identifies the authors and AAAS's
+  posting permission; this review does not infer copyright ownership from that
+  permission notice.
+
+**Clear public redistribution permission for this specific copy could not be
+confirmed. The PDF has therefore been removed from the current repository tree,
+with the official citation and links retained below.** No entry point or test
+reads it, and a search of all tracked text files found no relative PDF link
+requiring repair. Installation, reproduction, code and experiment evidence are
+unaffected.
+
+This is an ordinary deletion commit, **not a Git history rewrite**. Earlier
+commits and historical archives may still contain the old PDF; their copyright
+risk has not been cleared by this change. No paper content, other data, license
+file or historical archive was modified. No repository-wide license is inferred
+from the paper's license metadata.
 
 > Kamil Dreczkowski, Pietro Vitiello, Vitalis Vosylius, and Edward Johns.
 > Learning a Thousand Tasks in a Day. Science Robotics 10, eadv7594 (2025).

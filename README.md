@@ -92,4 +92,4 @@ The RealSense acquisition and object-segmentation methods in `pose_estimator.py`
 
 Kamil Dreczkowski, Pietro Vitiello, Vitalis Vosylius, and Edward Johns. **Learning a Thousand Tasks in a Day.** *Science Robotics* 10, eadv7594 (2025). [DOI](https://doi.org/10.1126/scirobotics.adv7594) · [arXiv v1](https://arxiv.org/abs/2511.10110v1) · [Authors' project](https://www.robot-learning.uk/learning-1000-tasks).
 
-Use the official paper links above; the bundled PDF is not required for installation or reproduction. See [paper permissions and repository licensing](REPRODUCING.md#paper-and-license-review) for the unresolved redistribution terms and repository license status.
+Use the official paper links above. The former bundled PDF was removed from the current tree because its redistribution permission could not be confirmed; installation and reproduction do not need it. Git history may still contain the old copy. See [paper permissions and repository licensing](REPRODUCING.md#paper-and-license-review) for the review and repository license status.
