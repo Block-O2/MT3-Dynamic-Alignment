@@ -1,6 +1,6 @@
 # MT3 Dynamic Alignment
 
-Replay a static-object manipulation demonstration on a moving tabletop object using **Kalman filtering, latency compensation, and object-relative demonstration replay**. This is an independent extension study inspired by [MT3 (Multi-Task Trajectory Transfer)](https://www.robot-learning.uk/learning-1000-tasks).
+Replay a static-object manipulation demonstration on a moving tabletop object using **Kalman filtering, latency compensation, and object-relative demonstration replay**. This extension study is inspired by [MT3 (Multi-Task Trajectory Transfer)](https://www.robot-learning.uk/learning-1000-tasks).
 
 **PyBullet simulation only · No policy retraining · No real-robot validation**
 
@@ -30,7 +30,7 @@ The [personal website](https://block-o2.github.io/) uses this same archived char
 
 These small, single-seed experiments support dynamic replay in this setup. They do not isolate the effect of prediction latency, establish a general optimal speed, or prove that filtering alone causes the improvement. The archived chart's speed-related causal annotations are hypotheses, not independently measured mechanisms.
 
-## Method and contribution
+## Method
 
 ```text
 T_WE_target(t) = T_delta(t + tau) @ T_WE_demo(t_demo)
@@ -38,7 +38,7 @@ T_WE_target(t) = T_delta(t + tau) @ T_WE_demo(t_demo)
 
 The tracker estimates the object's planar motion relative to the demonstration reference. A Kalman filter smooths that estimate and predicts ahead by `tau`; each demonstration pose is then transformed into the moving object's frame. Adaptive replay slows demonstration time when lateral alignment is poor.
 
-The original MT3 authors introduced the alignment/interaction decomposition and retrieval-based trajectory transfer. This repository contributes the continuous planar tracking and replay implementation, constant-velocity/coordinated-turn models, prediction interface, adaptive progress gate, unit tests, and Panda simulation experiments. It does not reproduce the original paper's 1,000-task hardware study or its full retrieval pipeline. No learned policy is trained or retrained here.
+The implementation combines continuous planar tracking and replay, constant-velocity/coordinated-turn models, a prediction interface, and an adaptive progress gate, with unit tests and Panda simulation experiments. It extends MT3's alignment/interaction approach to moving objects; the original paper's full retrieval pipeline and 1,000-task hardware study are outside this implementation's scope. No learned policy is trained or retrained here.
 
 ## Quick Start
 
@@ -88,8 +88,8 @@ It writes a new timestamped run under `simulation/results/canonical/`. This is a
 
 The RealSense acquisition and object-segmentation methods in `pose_estimator.py` are stubs. Deployment still requires perception integration, calibration, time synchronization, latency measurement, controller integration, and real-robot validation. Sawyer + RealSense D415 is a proposed target, not a demonstrated deployment. The implemented tracker is planar SE(2); the grasping experiment disables PCA yaw estimation and tests translation along a semicircle.
 
-## Upstream reference and permissions
+## References
 
 Kamil Dreczkowski, Pietro Vitiello, Vitalis Vosylius, and Edward Johns. **Learning a Thousand Tasks in a Day.** *Science Robotics* 10, eadv7594 (2025). [DOI](https://doi.org/10.1126/scirobotics.adv7594) · [arXiv v1](https://arxiv.org/abs/2511.10110v1) · [Authors' project](https://www.robot-learning.uk/learning-1000-tasks).
 
-The bundled paper PDF is not needed to install, test, or run this project. Its redistribution permission needs clarification: the PDF and arXiv comments restrict redistribution, while the arXiv license link points to CC BY-SA 4.0. It is retained unchanged pending clarification; use the official links above. See [the permissions review](REPRODUCING.md#paper-and-license-review). No repository license has been added because the authorization boundary is unresolved.
+Use the official paper links above; the bundled PDF is not required for installation or reproduction. See [paper permissions and repository licensing](REPRODUCING.md#paper-and-license-review) for the unresolved redistribution terms and repository license status.
