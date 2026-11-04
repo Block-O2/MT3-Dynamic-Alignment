@@ -1,17 +1,25 @@
 # Experiment Log
 
+> **Version note (2026-11-04):** This file preserves the development history.
+> The featured README/website result is the May 28, 15% dropout ablation:
+> 14/20, 16/20, 17/20, 5/20 dynamic-replay successes at 2/4/6/8 cm/s.
+> The earlier May 24 no-dropout ablation and the 10-trial run below are separate
+> experiments. See [ANALYSIS.md](ANALYSIS.md) and [REPRODUCING.md](REPRODUCING.md).
+> Historical mechanism explanations below are development hypotheses; the
+> revised analysis checks them against the archived failure labels.
+
 ## Overview
 
 | Experiment | What it tests | Key finding | Script |
 |------------|---------------|-------------|--------|
-| 02 | Single-object tracking from PyBullet depth images | Overhead RGB-D tracking reaches millimeter-level steady-state error | `simulation/02_tracker_sim.py` |
-| 03 | Closed-loop Panda tracking of a moving object | The end-effector can maintain a constant relative pose to the tracked object | `simulation/03_closed_loop.py` |
-| 04 | Latency compensation baseline | `tau=0.1s` prediction reduces relative error compared with pure reactive control | `simulation/04_baseline_comparison.py` |
-| 05 | Static demo replay on a moving object | A static-object demo can be replayed in the moving object's frame without retraining | `simulation/05_mt3_integration.py` |
-| 06 | Speed sensitivity | Performance degrades gradually near the designed speed limit | `simulation/06_speed_sensitivity.py` |
-| 07 | Motion type sensitivity | Circular and random smooth motions are easier than sharp linear reversals | `simulation/07_motion_type_comparison.py` |
-| 08 | Method comparison | Kalman + prediction gives the most reliable steady-state behavior under latency and noise | `simulation/08_method_comparison.py` |
-| 09 | Robustness analysis | Kalman filtering rejects outlier-driven degradation better than velocity feedforward | `simulation/09_robustness_analysis.py` |
+| 02 | Single-object tracking from PyBullet depth images | Overhead RGB-D tracking reaches millimeter-level steady-state error | `simulation/dev/02_tracker_sim.py` |
+| 03 | Closed-loop Panda tracking of a moving object | The end-effector can maintain a constant relative pose to the tracked object | `simulation/dev/03_closed_loop.py` |
+| 04 | Latency compensation baseline | `tau=0.1s` prediction reduces relative error compared with pure reactive control | `simulation/dev/04_baseline_comparison.py` |
+| 05 | Static demo replay on a moving object | A static-object demo can be replayed in the moving object's frame without retraining | `simulation/dev/05_mt3_integration.py` |
+| 06 | Speed sensitivity | Performance degrades gradually near the designed speed limit | `simulation/dev/06_speed_sensitivity.py` |
+| 07 | Motion type sensitivity | Circular and random smooth motions are easier than sharp linear reversals | `simulation/dev/07_motion_type_comparison.py` |
+| 08 | Method comparison | Kalman + prediction gives the most reliable steady-state behavior under latency and noise | `simulation/dev/08_method_comparison.py` |
+| 09 | Robustness analysis | Kalman filtering rejects outlier-driven degradation better than velocity feedforward | `simulation/dev/09_robustness_analysis.py` |
 | 10 | End-to-end moving-object grasping | Final strict grasping result shows an inverted-U speed response with best performance at 4-6 cm/s | `simulation/10_grasping_experiment.py` |
 
 ## Experiment Evolution: Grasping (`10_grasping_experiment`)
@@ -90,17 +98,17 @@ Why it failed / what was learned:
 What changed next:
 - Decoupled horizontal tracking from vertical descent using a prioritized Jacobian solve.
 
-### v5: Decoupled Jacobian Horizontal/Vertical Control
+### v5: Decoupled Jacobian Horizontal/Vertical Control (historical 10-trial run)
 
 Configuration changes made:
 - Solved horizontal XY tracking first with higher gain.
 - Projected vertical descent into the null space of the horizontal solution.
 - Added a pre-close check: if the box was more than 40 mm from the end-effector before gripper closing, abort the attempt and restart the demo.
 - Added a 5-frame moving average for lateral error before passing it to the adaptive gate.
-- Ran final canonical experiment at speeds `[2, 4, 6, 8]` cm/s, 10 trials each, seed 42.
+- Ran the then-current development experiment at speeds `[2, 4, 6, 8]` cm/s, 10 trials each, seed 42.
 
 Results obtained:
-- Final moving-object success rates:
+- Historical 10-trial moving-object success rates:
 
 | Speed | Success rate |
 |-------|--------------|
@@ -115,9 +123,9 @@ Why it failed / what was learned:
 - At 8 cm/s, the tracking mean can still be acceptable, but variance and controller bandwidth limits cause contact-window failures.
 
 What changed next:
-- This became the final canonical grasping configuration for the current simulation study.
+- This configuration preceded the later 20-trial ablations; its results remain a separate development record.
 
-## Key Findings
+## Historical Development Interpretations
 
 - Optimal speed range: 4-6 cm/s.
 - 2 cm/s failure mode: weak Kalman velocity signal.
@@ -127,13 +135,13 @@ What changed next:
 
 ## Raw Data
 
-All final experiment data is stored in:
+The earlier 10-trial development data is stored in:
 
 ```text
 simulation/results/raw/
 ```
 
-Final canonical grasping run:
+Historical development grasping run:
 
 ```text
 simulation/results/raw/10_grasping_final_seed42.csv
@@ -150,8 +158,9 @@ Seed: `42` for reproducibility.
 ## Note on Final Results
 
 The experiment evolution above (v1–v5) is a development history log.
-The canonical ablation results are in `simulation/results/canonical/` and
-summarized in `ANALYSIS.md`. The final study uses five conditions
-(static_replay, raw_observation, dynamic_tau0, uncertainty_gated,
-oracle_pose) across four speeds and 20 trials per cell, superseding the
-10-trial results shown above.
+Both later ablation runs are in `simulation/results/canonical/` and summarized
+in [ANALYSIS.md](ANALYSIS.md). The README features May 28 with 15% random
+point-cloud dropout; May 24 has no artificial dropout. The five reported
+conditions each have four speeds and 20 trials per cell. The May 28 CSV also
+retains 80 excluded `pd_feedforward` rows. Neither later experiment overwrites
+the 10-trial development data shown above.

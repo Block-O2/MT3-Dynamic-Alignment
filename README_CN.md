@@ -1,105 +1,84 @@
 # MT3 动态对准
 
-面向移动物体的连续目标跟踪与延迟补偿 demo replay，使静态物体上的 MT3 示教可以迁移到运动物体。
+通过 **Kalman 滤波、延迟补偿与物体相对坐标系示教回放**，把静态物体上的操作轨迹应用到移动桌面物体。本项目是受 [MT3（Multi-Task Trajectory Transfer）](https://www.robot-learning.uk/learning-1000-tasks) 启发的独立扩展研究。
 
-> **状态：** PyBullet 仿真研究已完成。五条件 ablation（static_replay、raw_observation、dynamic_tau0、uncertainty_gated、oracle_pose）已在 4 个速度 × 20 次试验上验证。Sawyer + RealSense D415 硬件验证是下一步。
+**仅 PyBullet 仿真 · 不进行 policy retraining · 未经真机验证**
 
-## Demo
+当前展示采用 **2026-05-28、15% 随机点云丢帧**的实验：在 2/4/6/8 cm/s 下分别成功 **14/20、16/20、17/20、5/20（70%、80%、85%、25%）**，静态回放均为 0/20。方块使用固定约束连接夹爪；成绩反映对准与回放，不是完整物理接触抓取基准。
 
-![Franka Panda 在 PyBullet 中抓取移动物体](simulation/results/plot/grasping_demo.gif)
+[Demo](simulation/results/canonical/ablation_20260528_232432/grasping_demo.gif) · [图表](simulation/results/canonical/ablation_20260528_232432/grasping_success_rate.png) · [原始 CSV](simulation/results/canonical/ablation_20260528_232432/raw_trials.csv) · [复现说明](REPRODUCING.md) · [English](README.md)
 
-Franka Panda 使用静态物体上的抓取示教，在桌面移动物体上完成 replay。整个过程不需要重新训练。
+[![Franka Panda 在 PyBullet 中对移动物体回放抓取轨迹](simulation/results/canonical/ablation_20260528_232432/grasping_demo.gif)](simulation/results/canonical/ablation_20260528_232432/grasping_demo.gif)
 
-## 核心公式
+约 3 倍速的实际仿真录像。脚本在 PyBullet 内生成并记录静态抓取轨迹，没有加载原 MT3 真机系统采集的示教。
+
+## 结果与版本
+
+[![5 月 28 日五条件消融实验](simulation/results/canonical/ablation_20260528_232432/grasping_success_rate.png)](simulation/results/canonical/ablation_20260528_232432/grasping_success_rate.png)
+
+| 条件 | 2 cm/s | 4 cm/s | 6 cm/s | 8 cm/s |
+|---|---:|---:|---:|---:|
+| static_replay | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) |
+| dynamic_tau0 | 14/20 (70%) | 16/20 (80%) | 17/20 (85%) | 5/20 (25%) |
+| raw_observation | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) |
+| uncertainty_gated | 8/20 (40%) | 12/20 (60%) | 10/20 (50%) | 6/20 (30%) |
+| oracle_pose | 20/20 (100%) | 20/20 (100%) | 20/20 (100%) | 20/20 (100%) |
+
+来源为 `ablation_20260528_232432`，seed 42，每格 20 次。`dynamic_tau0` 是历史名字，**代码实际使用 `TAU=0.1s`，不是零预测**。归档含 480 行，其中 80 行 `pd_feedforward` 因此前分析报告的实现 bug 不纳入五条件比较，原始记录全部保留。
+
+[个人网站](https://block-o2.github.io/)使用同源的 canonical 图和 GIF。旧 [plot 图](simulation/results/plot/grasping_success_rate.png) 对应 5 月 24 日无人工丢帧的 50%/75%/85%/20%；更早的每格 10 次开发结果也独立保留。来源、完整表格及解释边界见 [中文分析](ANALYSIS_CN.md)、[开发日志](EXPERIMENTS.md) 和 [归档索引](simulation/results/canonical/README.md)。
+
+这些单 seed 小样本支持本场景下的动态回放，但没有隔离延迟预测的收益，也不能证明滤波是唯一改善原因、门控等效或存在普遍最佳速度。归档图中的速度机制注释属于假设。
+
+## 方法与贡献
 
 ```text
-T_WE_target(t) = T_delta(t + tau) · T_WE_demo(t)
+T_WE_target(t) = T_delta(t + tau) @ T_WE_demo(t_demo)
 ```
 
-`T_WE_demo(t)` 是 MT3 在静态物体上记录的末端执行器位姿序列。`T_delta(t + tau)` 是物体运动的延迟补偿预测，因此机器人执行的是移动物体坐标系下的原始示教，而不是追逐已经过时的观测位置。
+跟踪器估计物体相对示教参考帧的平面运动，经 Kalman 平滑并向前预测，再变换每帧末端位姿。自适应回放在横向对准较差时放慢示教时钟。
 
-## 关键结果
-
-![抓取成功率](simulation/results/plot/grasping_success_rate.png)
-
-当前 PyBullet ablation 使用五个条件，在四个物体速度上分别进行 20 次试验。`static_replay` 在所有速度下成功率均为 0%，说明直接把静态物体示教 replay 到移动物体上确实会失败。`dynamic_tau0` 在 2-6 cm/s 下达到 70-85% 成功率，在 8 cm/s 下降到 25%。`oracle_pose` 在所有速度下达到 100%，说明控制器不是瓶颈。`raw_observation` 成功率为 0%，说明 Kalman 滤波是必要的。`uncertainty_gated` 在仿真中与 `dynamic_tau0` 表现接近；PyBullet 中协方差矩阵接近常量，因此需要真实硬件来区分二者。
-
-## 工作原理
-
-Tracker 估计物体相对于静态示教时的位置变化。Kalman 滤波器对这个运动估计进行平滑，并向未来预测一小段时间，用来补偿相机、计算和执行延迟。机器人随后用预测出的物体运动去变换每一帧 demo 位姿，因此同一段示教可以跟随移动物体执行。对于抓取任务，自适应 replay 会在对准较差时放慢 demo，等手臂重新对准后再继续执行。
-
-## 模块结构
-
-```text
-MT3_dynamic_alignment/
-├── dynamic_alignment/          核心实现
-│   ├── types.py                共享数据结构
-│   ├── motion_models.py        常速度与协调转弯运动模型
-│   ├── kalman.py               Kalman / EKF 滤波器
-│   ├── pose_estimator.py       点云到物体运动观测
-│   └── tracker.py              主跟踪与目标位姿接口
-│
-├── examples/
-│   └── simulate_and_plot.py    最小合成仿真示例
-│
-├── simulation/                 PyBullet 实验
-│   ├── dev/                    开发与诊断脚本，02-09_*.py
-│   ├── 10_grasping_experiment.py
-│   └── results/
-│       ├── canonical/          带时间戳的 ablation 运行，每个目录包含 command.txt、config.json、raw_trials.csv 和图表
-│       └── plot/               图表与 demo GIF
-│
-├── tests/                      无硬件依赖的单元测试
-├── MT3_dynamic_alignment_notes.md
-└── 2511.10110v1.pdf            MT3 论文
-```
+原 MT3 作者提出 alignment/interaction 分解与检索式轨迹迁移。本仓库的增量是连续平面跟踪、CV/CT 运动模型、预测接口、自适应进度门控、单元测试和 Panda 仿真实验；没有复现原论文的千任务真机研究或完整检索链路，也没有训练或重训策略。
 
 ## 快速开始
 
-创建环境：
+使用 Python 3.11，从新检出开始：
 
 ```bash
-conda create -n dynamic_mt3 python=3.11 numpy matplotlib pytest -y
+git clone https://github.com/Block-O2/MT3-Dynamic-Alignment.git
+cd MT3-Dynamic-Alignment
+conda create -n dynamic_mt3 python=3.11 pip -y
 conda activate dynamic_mt3
-```
-
-运行测试：
-
-```bash
+python -m pip install -r requirements.txt
 python -m pytest tests/ -v
-```
-
-运行最小仿真示例：
-
-```bash
 python examples/simulate_and_plot.py
 ```
 
-PyBullet 实验还需要在同一环境中安装 `pybullet`、`pillow` 和 `imageio`。
+测试和合成示例无需机器人、ROS、相机或 PyBullet。示例生成三张图到根目录 `results/`，与归档分开。
 
-## 与 MT3 集成
+只读核验归档成绩（只需 Python 标准库）：
 
-真实部署只需要替换两个感知 stub，并在控制器中切换目标位姿来源。
-
-```python
-# 1. 替换 pose_estimator.py 中的硬件 stub
-PoseEstimator.get_point_cloud_from_realsense()   # RealSense SDK
-PoseEstimator.segment_object_by_bbox()           # MT3 点云分割
-
-# 2. 在 MT3/GICP 对准完成后初始化一次
-tracker.init(current_cloud, initial_theta=gicp_theta, timestamp=t0)
-
-# 3. 在控制循环中使用动态目标位姿
-state = tracker.update(current_cloud, timestamp=t)
-T_target = tracker.get_target_pose(demo_data, t_demo=phase_time, tau=0.1)
+```bash
+python simulation/summarize_canonical.py
 ```
 
-MT3 原有 demo 数据格式可以保持不变：`DemoData` 继续保存原始末端执行器位姿序列和时间戳。
+当前无 GUI 的 PyBullet 实验（400 次，可能耗时数小时）：
 
-## 设计说明
+```bash
+python -m pip install -r requirements-simulation.txt
+python simulation/10_grasping_experiment.py
+```
 
-推导、延迟补偿分析、运动模型假设和两阶段 replay 设计见 [`MT3_dynamic_alignment_notes.md`](MT3_dynamic_alignment_notes.md)。
+输出写入 `simulation/results/canonical/` 下的新时间戳目录。当前五条件运行不等于精确恢复历史六条件归档；依赖、源码快照缺口和实际验证范围见 [REPRODUCING.md](REPRODUCING.md)。
 
-## 致谢
+## 文档与部署状态
 
-本项目研究如何将 MT3（Multi-Task Trajectory Transfer，Science Robotics 2025）的 demo replay 从静态物体扩展到缓慢移动的桌面物体，使用单个示教且不进行重新训练。
+核心代码见 [`dynamic_alignment/`](dynamic_alignment)，早期诊断见 [`simulation/dev/`](simulation/dev)，设计推导见 [研究笔记](MT3_dynamic_alignment_notes.md)。
+
+RealSense 采集和物体分割仍为 stub；真机部署还需感知集成、标定、时间同步、延迟测量、控制器适配与硬件验证。Sawyer + RealSense D415 是拟议目标，并非已验证平台。跟踪器为平面 SE(2)，本抓取实验关闭 PCA yaw，仅测试往返半圆平移。
+
+## 原论文与授权
+
+Kamil Dreczkowski, Pietro Vitiello, Vitalis Vosylius, Edward Johns. **Learning a Thousand Tasks in a Day.** *Science Robotics* 10, eadv7594 (2025). [DOI](https://doi.org/10.1126/scirobotics.adv7594) · [arXiv v1](https://arxiv.org/abs/2511.10110v1) · [作者项目](https://www.robot-learning.uk/learning-1000-tasks)。
+
+根目录 PDF 不参与安装、测试或仿真。PDF 及 arXiv 评论限制再分发，但 arXiv 许可链接指向 CC BY-SA 4.0，两者存在冲突。暂保留原文件，优先使用官方链接，待核实授权；未擅自添加仓库许可证。详见 [权限审查](REPRODUCING.md#paper-and-license-review)。

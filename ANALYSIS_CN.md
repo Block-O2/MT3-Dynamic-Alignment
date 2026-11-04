@@ -1,74 +1,65 @@
 # PyBullet 仿真分析
 
-## 引言
+本说明与 [英文分析](ANALYSIS.md) 使用相同的原始记录。README 和个人网站统一展示 **2026-05-28、15% 随机点云丢帧**的 `ablation_20260528_232432`；2026-05-24 的无遮挡运行作为独立历史实验保留。展示选择不代表遮挡提高性能，也不覆盖旧数据。
 
-本文总结 MT3 动态对准的 PyBullet 仿真研究：通过跟踪物体运动并在线变换示教轨迹，将静态物体上的 MT3 示教 replay 到缓慢移动的桌面物体上。主要结果来自 `ablation_20260524_233332`；`ablation_20260528_232432` 仅作为遮挡检查。
+## 实验来源
 
-## 实验设置
+| 运行 | 条件 | 原始行数 |
+|---|---|---:|
+| [2026-05-24](simulation/results/canonical/ablation_20260524_233332) | seed 42，每格 20 次，2/4/6/8 cm/s，`TAU=0.1`，无人工丢帧 | 400 |
+| [2026-05-28](simulation/results/canonical/ablation_20260528_232432) | 相同 seed、次数、速度和 TAU，额外 `OCCLUSION_PROB=0.15` | 480 |
 
-共进行了两组 ablation。
+2026-11-04 从 CSV 的 `success` 列只读汇总，确认每个条件和速度组合恰有 trial 1–20，无缺失或重复。可运行 `python simulation/summarize_canonical.py` 重新核验，不写入原始数据。
 
-| 运行 | 目录 | 设置 |
-|-----|------|------|
-| Run 1 | `ablation_20260524_233332` | 5 个条件，无遮挡，`SEED=42`，`N_TRIALS=20`，`TAU=0.1`，速度 `[2.0, 4.0, 6.0, 8.0]` cm/s |
-| Run 2 | `ablation_20260528_232432` | 同样设置，额外加入 `OCCLUSION_PROB=0.15`；曾加入 `pd_feedforward`，但因实现 bug 失败，因此排除 |
+## 当前展示：5 月 28 日，15% 丢帧
 
-每个条件-速度组合包含 20 次试验。所有条件都有较高方差，约为 +/-40-50% 标准差，因此结论应视为方向性结果。
-
-## 结果
-
-Run 1 成功率是主要结果。
-
-| condition | 2 cm/s | 4 cm/s | 6 cm/s | 8 cm/s |
+| 条件 | 2 cm/s | 4 cm/s | 6 cm/s | 8 cm/s |
 |---|---:|---:|---:|---:|
-| static_replay | 0 | 0 | 0 | 0 |
-| raw_observation | 0 | 0 | 0 | 0 |
-| dynamic_tau0 | 50 | 75 | 85 | 20 |
-| uncertainty_gated | 45 | 60 | 45 | 35 |
-| oracle_pose | 100 | 100 | 100 | 100 |
+| static_replay | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) |
+| raw_observation | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) |
+| dynamic_tau0 | 14/20 (70%) | 16/20 (80%) | 17/20 (85%) | 5/20 (25%) |
+| uncertainty_gated | 8/20 (40%) | 12/20 (60%) | 10/20 (50%) | 6/20 (30%) |
+| oracle_pose | 20/20 (100%) | 20/20 (100%) | 20/20 (100%) | 20/20 (100%) |
 
-Run 2 在 15% 随机逐帧遮挡下的成功率如下。
+[图表](simulation/results/canonical/ablation_20260528_232432/grasping_success_rate.png) · [Demo](simulation/results/canonical/ablation_20260528_232432/grasping_demo.gif) · [CSV](simulation/results/canonical/ablation_20260528_232432/raw_trials.csv) · [配置](simulation/results/canonical/ablation_20260528_232432/config.json)
 
-| condition | 2 cm/s | 4 cm/s | 6 cm/s | 8 cm/s |
+原始 CSV 还保留 80 条 `pd_feedforward` 试验，各速度均为 0/20。此前分析记载该条件有实现 bug，故不纳入五条件比较；当前已提交代码没有此条件，无法从配置记录的提交独立恢复其实现或核验 bug 细节。数据与元信息均未删除。
+
+## 历史对照：5 月 24 日，无人工丢帧
+
+| 条件 | 2 cm/s | 4 cm/s | 6 cm/s | 8 cm/s |
 |---|---:|---:|---:|---:|
-| static_replay | 0 | 0 | 0 | 0 |
-| raw_observation | 0 | 0 | 0 | 0 |
-| dynamic_tau0 | 70 | 80 | 85 | 25 |
-| uncertainty_gated | 40 | 60 | 50 | 30 |
-| oracle_pose | 100 | 100 | 100 | 100 |
+| static_replay | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) |
+| raw_observation | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) | 0/20 (0%) |
+| dynamic_tau0 | 10/20 (50%) | 15/20 (75%) | 17/20 (85%) | 4/20 (20%) |
+| uncertainty_gated | 9/20 (45%) | 12/20 (60%) | 9/20 (45%) | 7/20 (35%) |
+| oracle_pose | 20/20 (100%) | 20/20 (100%) | 20/20 (100%) | 20/20 (100%) |
 
-在 Run 1 的 `dynamic_tau0` 中，2 cm/s 的主导失败模式是 `attempt_limit`：机器人无法足够接近目标。8 cm/s 时 `lift` 占主导：夹爪闭合但错过物体。4-6 cm/s 的失败分布在多个类别中，更接近随机感知噪声。
+旧 [plot 图](simulation/results/plot/grasping_success_rate.png) 对应这组百分比；[开发日志](EXPERIMENTS.md) 中 30%/80%/80%/30% 则来自更早的每格 10 次开发试验，不应混用。
 
-## 关键发现
+## 条件与成功标准
 
-### 1. Static Replay 完全失败
+Franka Panda 在 PyBullet 内生成并记录静态抓取轨迹，随后对移动方块回放；不加载原 MT3 真机示教，不训练或重训策略。方块沿半径 0.15 m 的往返半圆平移；控制频率 30 Hz，每步八个物理子步，每次回放最多 25 秒、三次尝试。抓取实验关闭 PCA yaw 估计。
 
-`static_replay` 在所有速度下成功率均为 0%。直接在移动物体上 replay 静态示教不可行，因此动态适应是必要的。
+- `static_replay`：直接回放原轨迹，不做在线物体变换。
+- `raw_observation`：质心平移，无 Kalman/预测；无效点云时冻结示教时钟。
+- `dynamic_tau0`：Kalman、**实际 `tau=0.1s`**、基于横向误差的自适应回放；名字是历史标签，不代表零预测。
+- `uncertainty_gated`：相同跟踪与预测，用位置协方差量代替横向误差输入门控。
+- `oracle_pose`：使用真值平移，示教时钟正常推进。
 
-### 2. Kalman 滤波是必要的
+15% 丢帧是在感知条件的观测调用中随机用空点云替换整帧，不等于真实机械臂遮挡或实测相机延迟。
 
-`raw_observation` 成功率同样为 0%。它与 `static_replay` 成功率相同，但失败原因不同：夹爪会闭合但错过物体，表现为 lift failure，而不是 `attempt_limit`。原始质心观测不够稳定。
+成功须同时满足：最终抬升 >50 mm；连接时相对物体坐标系示教目标的水平误差 ≤15 mm；夹爪轴向误差 ≤20°；连接前 0.5 秒内最大接近误差 ≤20 mm。方块靠近并闭爪后用固定约束连接，评估的是几何对准与回放，不是摩擦接触、触觉或力控制抓取。
 
-### 3. 控制器不是瓶颈
+## 结论边界
 
-`oracle_pose` 在所有速度下达到 100% 成功率。相同控制器在完美物体位姿下可以成功，说明限制因素是感知与状态估计。
+- 动态回放在这些条件下优于静态和原始观测回放；但滤波、预测和回放时钟同时改变，不能单独归因于 Kalman 或延迟补偿。
+- 两组实验中，uncertainty gate 在 2/4/6 cm/s 的成功率均低于 dynamic replay，8 cm/s 略高。不能称二者等效，也不能据此确认协方差门控普遍有效；CSV 未归档协方差时序。
+- Oracle 每格 20/20 说明理想平移信息在简化场景下可成功，不能排除真实感知、延迟和接触下的控制器限制。
+- 5 月 28 日 dynamic replay 在 2 cm/s 的失败为 5 次 attempt_limit、1 次 approach；8 cm/s 为 15 次 attempt_limit。5 月 24 日 8 cm/s 也有 14 次 attempt_limit。旧文“高速动态回放主要为 lift miss”的说法与原始标签不符。
+- 归档图上的“弱速度信号”“最佳区间”“控制带宽限制”属于机制假设，不能只凭计数证明。
+- 单 seed、每格 20 次的比例不确定性较大；二值结果约 40–50 个百分点的标准差不等于成功率估计的置信区间。不宣称显著性或丢帧带来的因果改善。
+- 当前抓取仿真没有注入实测端到端延迟，也没有受控 tau 对照。合成示例和单元测试不能证明真机延迟补偿效果。
+- 跟踪器限于平面 SE(2)，本抓取实验只测试平移和单一任务。Sawyer/RealSense 仍未集成验证，所有真机表现均待确认。
 
-### 4. 失败模式与速度相关
-
-2 cm/s 时速度信号弱，Kalman 预测的信噪比较低。8 cm/s 时失败转向 lift miss，与控制带宽限制一致。Run 1 中最佳速度范围是 4-6 cm/s。
-
-### 5. uncertainty_gated 在仿真中无法区分
-
-`uncertainty_gated` 在 PyBullet 中与 `dynamic_tau0` 难以区分。Kalman 协方差 `P` 接近常量，因为噪声是固定且合成的，没有真实感知变化。这是仿真限制，不是方法缺陷。
-
-### 6. 随机遮挡结构性不足
-
-Run 2 表明，15% 随机逐帧遮挡没有产生足够结构化的感知变化，无法区分 `uncertainty_gated` 和 `dynamic_tau0`。下降过程中由机械臂造成的遮挡会更真实。
-
-## 局限性
-
-没有真实延迟时，无法验证 `tau` 补偿。当前模型只处理平面 SE(2)，不处理 6D 运动。实验只测试了抓取。每个条件 20 次试验导致高方差。PyBullet 接触动力学也不同于真实硬件。
-
-## 需要的硬件验证
-
-需要硬件实验来验证真实感知与执行延迟下的 `tau` 补偿，评估 `uncertainty_gated` 在运动模糊、遮挡和点云密度变化下的表现，并测试该方法是否能泛化到抓取以外的其他示教类型。
+复现命令、实际验证范围和历史源码快照缺口见 [REPRODUCING.md](REPRODUCING.md)。
